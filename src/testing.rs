@@ -669,7 +669,6 @@ fn build_http_request(action: &Action, context: &Value) -> HttpRequest {
         vec![],
         req_params,
         headers,
-        cookies,
     );
     HttpRequest::new(
         endpoint,

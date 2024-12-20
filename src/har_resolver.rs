@@ -1,23 +1,26 @@
 use crate::models::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
 use crate::models::{
-    Action, Assertion, Expression, FlattenKeyPrefixType, Parameter, ParameterLocation,
-    ParameterType, TestCase,
+    Action, Assertion, AuthHeaderValue, AuthenticationProvider, Expression, FlattenKeyPrefixType,
+    Parameter, ParameterLocation, ParameterType, TestCase,
 };
 use crate::repo::Repository;
 use futures::StreamExt;
-use har::v1_2::{Entries, Request};
+use har::v1_2::{Entries, Headers, Request};
 use har::Spec;
 use regex::Regex;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
+use uuid::Uuid;
 
 pub async fn build_test_case(
     repository: &Repository,
     spec: &Spec,
     customer_id: &String,
     test_case_name: &String,
+    description: &String,
+    excluded_path_parts: Vec<String>,
 ) {
     match spec {
         Spec::V1_2(log_v1) => {
@@ -25,10 +28,10 @@ pub async fn build_test_case(
                 .entries
                 .iter()
                 .filter(|entry| {
-                    url_included(&entry.request.url, &".*app.opsgenie.com.*".to_string())
+                    !excluded_path_parts
+                        .iter()
+                        .any(|part| entry.request.url.contains(part))
                 })
-                .filter(|entry| !url_excluded(&entry.request.url, &".*/gateway/api.*".to_string()))
-                .filter(|entry| !url_excluded(&entry.request.url, &".*/jira/.*".to_string()))
                 .collect();
             let response_indexes: Vec<HashMap<String, Value>> = entries
                 .iter()
@@ -45,19 +48,53 @@ pub async fn build_test_case(
                 customer_id: customer_id.clone(),
                 id: uuid::Uuid::new_v4().to_string(),
                 name: test_case_name.clone(),
+                description: description.clone(),
             };
             let created_test_case = repository.create_test_case(case).await;
 
             let mut actions = vec![];
+            let mut auth_headers_by_base_url: HashMap<
+                String,
+                Vec<HashMap<String, AuthHeaderValue>>,
+            > = HashMap::new();
             for i in 0..entries.len() {
                 let current = entries.get(i).unwrap();
                 println!("{:#?}", current.request.url);
                 let action = build_action(i, &created_test_case, current);
                 let input_parameters =
                     build_action_input(&action, &current.request, &response_indexes);
+                let output_parameters = build_output_parameters(&action, current);
                 actions.push(action);
                 repository.batch_create_parameters(input_parameters).await;
+                repository.batch_create_parameters(output_parameters).await;
+                let auth_headers = build_auth_headers(&current.request);
+                let base_url = obtain_base_url(&current.request.url.as_str());
+                auth_headers_by_base_url
+                    .entry(base_url)
+                    .or_insert_with(Vec::new)
+                    .push(auth_headers);
             }
+            let auth_providers = auth_headers_by_base_url
+                .iter()
+                .map(|(base_url, headers)| {
+                    let mut headers_by_name: HashMap<String, AuthHeaderValue> = HashMap::new();
+                    headers.iter().for_each(|map| {
+                        map.iter().for_each(|(k, v)| {
+                            headers_by_name.insert(k.to_string(), v.clone());
+                        })
+                    });
+                    let mut test_case_ids = HashSet::new();
+                    test_case_ids.insert(created_test_case.id.clone());
+                    AuthenticationProvider {
+                        customer_id: customer_id.clone(),
+                        id: Uuid::new_v4().to_string(),
+                        base_url: base_url.clone(),
+                        headers_by_name: headers_by_name.clone(),
+                        linked_test_case_ids: test_case_ids,
+                    }
+                })
+                .collect::<Vec<AuthenticationProvider>>();
+            repository.batch_create_auth_providers(auth_providers).await;
             repository.batch_create_actions(actions).await;
         }
         Spec::V1_3(log_v2) => {}
@@ -118,6 +155,35 @@ fn build_response_index(order: usize, entry: &Entries) -> HashMap<String, Value>
     })
 }
 
+fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
+    let response = &entry.response;
+    let content = &response.content;
+    let option = &content.text;
+    let mut parameters = vec![];
+    option.as_ref().iter().for_each(|text| {
+        let mut result = HashMap::<String, Value>::new();
+        let response_value = serde_json::from_str::<Value>(&text).unwrap();
+        flatten_json_value(
+            &action.name,
+            &Input,
+            &response_value,
+            "".to_string(),
+            &mut result,
+        );
+        result.iter().for_each(|(key, value)| {
+            let parameter = build_parameter(
+                action,
+                None,
+                value.clone(),
+                ParameterLocation::Body(key.to_string()),
+                ParameterType::Output,
+            );
+            parameters.push(parameter);
+        });
+    });
+    parameters
+}
+
 fn build_request_index(order: usize, entry: &Entries) -> HashMap<String, Value> {
     let request = &entry.request;
     let optional_post_data = request.post_data.as_ref();
@@ -158,7 +224,7 @@ fn build_action_input(
     let cookie_params = build_cookie_parameters(action, request, response_indexes);
     query_params.extend(body_params);
     query_params.extend(header_params);
-    query_params.extend(cookie_params);
+    //query_params.extend(cookie_params);
     query_params
 }
 
@@ -224,6 +290,7 @@ fn build_body_parameters(
                         expression_result,
                         value.clone(),
                         ParameterLocation::Body(key.to_string()),
+                        ParameterType::Input,
                     );
                     parameters.push(parameter);
                 })
@@ -244,6 +311,7 @@ fn build_body_parameters(
                         expression_result,
                         Value::String(param.value.clone().unwrap()),
                         ParameterLocation::Body(param.name.clone()),
+                        ParameterType::Input,
                     );
                     parameters.push(parameter);
                 })
@@ -269,6 +337,7 @@ fn build_query_parameters(
             expression,
             Value::String(query_string.value.clone()),
             ParameterLocation::Query(query_string.name.clone()),
+            ParameterType::Input,
         ));
     });
     parameters
@@ -279,6 +348,7 @@ fn build_parameter(
     expression: Option<Expression>,
     value: Value,
     location: ParameterLocation,
+    parameter_type: ParameterType,
 ) -> Parameter {
     Parameter {
         customer_id: action.customer_id.clone(),
@@ -286,7 +356,7 @@ fn build_parameter(
         action_id: action.id.clone(),
         value_expression: expression,
         id: uuid::Uuid::new_v4().to_string(),
-        parameter_type: ParameterType::Input,
+        parameter_type: parameter_type,
         location,
         value,
     }
@@ -298,20 +368,43 @@ fn build_header_parameters(
     response_indexes: &Vec<HashMap<String, Value>>,
 ) -> Vec<Parameter> {
     let mut parameters: Vec<Parameter> = vec![];
-    request.headers.iter().for_each(|header| {
-        let expression = resolve_value_expression_from_prev(
-            action.order,
-            &Value::String(header.value.clone()),
-            response_indexes,
-        );
-        parameters.push(build_parameter(
-            action,
-            expression,
-            Value::String(header.value.clone()),
-            ParameterLocation::Header(header.name.clone()),
-        ));
-    });
+    request
+        .headers
+        .iter()
+        .filter(|header| !is_auth_related_header(&header.name))
+        .for_each(|header| {
+            let expression = resolve_value_expression_from_prev(
+                action.order,
+                &Value::String(header.value.clone()),
+                response_indexes,
+            );
+            parameters.push(build_parameter(
+                action,
+                expression,
+                Value::String(header.value.clone()),
+                ParameterLocation::Header(resolve_header_name(header)),
+                ParameterType::Input,
+            ));
+        });
     parameters
+}
+
+fn build_auth_headers(request: &Request) -> HashMap<String, AuthHeaderValue> {
+    let mut auth_headers_by_name: HashMap<String, AuthHeaderValue> = HashMap::new();
+    request
+        .headers
+        .iter()
+        .filter(|header| is_auth_related_header(&header.name))
+        .for_each(|header| {
+            auth_headers_by_name.insert(
+                resolve_header_name(header),
+                AuthHeaderValue {
+                    value: header.value.clone(),
+                    disabled: false,
+                },
+            );
+        });
+    auth_headers_by_name
 }
 
 fn build_cookie_parameters(
@@ -331,6 +424,7 @@ fn build_cookie_parameters(
             expression,
             Value::String(cookie.value.clone()),
             ParameterLocation::Cookie(cookie.name.clone()),
+            ParameterType::Input,
         ));
     });
     parameters
@@ -495,4 +589,42 @@ fn reverse_flatten_all(path_value_pairs: Vec<(String, Value)>) -> Value {
     }
 
     Value::Object(root)
+}
+
+fn is_auth_related_header(key: &String) -> bool {
+    vec![
+        "authorization",
+        "token",
+        "session",
+        "csrf",
+        "user",
+        "origin",
+        "cookie",
+        "auth",
+    ]
+    .iter()
+    .any(|x| key.contains(x))
+}
+
+fn obtain_base_url(url: &str) -> String {
+    // Step 1: Find the scheme (http:// or https://)
+    if let Some(scheme_end) = url.find("://") {
+        // Step 2: Find the part after the scheme and the domain/subdomain
+        let domain_start = scheme_end + 3; // Skip past "://"
+
+        // Step 3: Find where the domain ends (after domain comes `/`, `?`, or `#`)
+        if let Some(first_delim) = url[domain_start..].find(&['/', '?', '#'][..]) {
+            // Return the base URL including the scheme and the domain only
+            return url[0..=domain_start + first_delim - 1].to_string();
+        }
+        // If no delimiter is found, return the full URL (i.e., no path/query)
+        return url.to_string();
+    }
+
+    // If no scheme is found, return the input as is
+    url.to_string()
+}
+
+fn resolve_header_name(header: &Headers) -> String {
+    header.name.replace(":", "")
 }

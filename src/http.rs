@@ -5,10 +5,10 @@ use serde_json::Value;
 use std::fmt::Display;
 use std::str::FromStr;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReqParam {
-    key: String,
-    value: String,
+    pub key: String,
+    pub value: String,
 }
 
 impl ReqParam {
@@ -19,21 +19,26 @@ impl ReqParam {
 
 #[derive(Serialize, Deserialize)]
 pub struct ReqBody {
-    value: Value,
+    pub value: Option<Value>,
 }
 
 impl ReqBody {
+
+    pub fn empty() -> Self {
+        ReqBody { value: None }
+    }
     pub fn new(value: Value) -> Self {
-        Self { value }
+        Self {
+            value: Some(value),
+        }
     }
 }
 
 pub struct Endpoint {
     method: HttpMethod,
     path: String,
-    query_params: Vec<ReqParam>,
+    pub query_params: Vec<ReqParam>,
     headers: Vec<ReqParam>,
-    cookies: Vec<ReqParam>,
 }
 
 impl Endpoint {
@@ -43,7 +48,6 @@ impl Endpoint {
         path_params: Vec<ReqParam>,
         query_params: Vec<ReqParam>,
         headers: Vec<ReqParam>,
-        cookies: Vec<ReqParam>,
     ) -> Endpoint {
         let mut raw_path = path;
         path_params.into_iter().for_each(|(param)| {
@@ -54,7 +58,6 @@ impl Endpoint {
             path: raw_path,
             query_params,
             headers,
-            cookies,
         }
     }
 
@@ -68,20 +71,24 @@ impl Endpoint {
                 .map(|param| format!("{}={}", param.key, param.value))
                 .collect::<Vec<String>>()
                 .join("&");
-            format!("{}?{}",self.path, query)
+            format!("{}?{}", self.path, query)
         }
     }
 }
 
 pub struct HttpRequest {
-    endpoint: Endpoint,
-    req_body: ReqBody,
-    content_type: String,
+    pub endpoint: Endpoint,
+    pub req_body: ReqBody,
+    pub content_type: String,
 }
 
 impl HttpRequest {
     pub fn new(endpoint: Endpoint, req_body: ReqBody, content_type: String) -> HttpRequest {
-        HttpRequest { endpoint, req_body, content_type }
+        HttpRequest {
+            endpoint,
+            req_body,
+            content_type,
+        }
     }
 }
 
@@ -97,7 +104,7 @@ impl<T> ResBody<T> {
 
 pub struct HttpResult<T> {
     pub res_body: ResBody<T>,
-    status_code: u16,
+    pub status_code: u16,
 }
 
 impl<T> HttpResult<T> {
@@ -108,16 +115,31 @@ impl<T> HttpResult<T> {
         }
     }
 }
+#[derive(Clone)]
 pub enum HttpError {
-    Status(StatusError),
+    Status(u16, StatusError),
+    Io(String),
+}
+
+impl HttpError {
+    pub fn get_message(&self) -> String {
+        match self {
+            HttpError::Status(_, status_err) => match status_err {
+                StatusError::ClientError(msg) => msg.to_string(),
+                StatusError::ServerError(mgs) => mgs.to_string(),
+            },
+            HttpError::Io(msg) => msg.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
-enum StatusError {
+pub enum StatusError {
     ClientError(String),
     ServerError(String),
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     auth_header: (String, String),
@@ -165,25 +187,25 @@ impl ApiClient {
                 println!("http request executed, status_code: {}", status_code);
                 if status_code.is_success() {
                     let response_string = response.text().await.unwrap();
-                    println!("http request executed, response_string: {}", response_string.clone());
                     let parsed: Value = serde_json::from_str(&response_string).unwrap();
-                    println!("response json: {:?}", parsed);
                     Ok(HttpResult::new(ResBody::new(parsed), status_code.as_u16()))
                 } else if status_code.is_client_error() {
                     let text = response.text().await.unwrap();
                     println!("http request failed: {}", text);
-                    Err(HttpError::Status(StatusError::ClientError(text)))
+                    Err(HttpError::Status(
+                        status_code.as_u16(),
+                        StatusError::ClientError(text),
+                    ))
                 } else {
-                    Err(HttpError::Status(StatusError::ServerError(
-                        response.text().await.unwrap(),
-                    )))
+                    Err(HttpError::Status(
+                        status_code.as_u16(),
+                        StatusError::ServerError(response.text().await.unwrap()),
+                    ))
                 }
             }
             Err(error) => {
                 println!("http request failed: {}", error);
-                Err(HttpError::Status(StatusError::ClientError(
-                    error.to_string(),
-                )))
+                Err(HttpError::Io(error.to_string()))
             }
         }
     }
@@ -196,7 +218,6 @@ impl ApiClient {
         println!("url: {}", url_string);
         println!("content type: {}", content_type);
         println!("method: {:?}", endpoint.method);
-        println!("request body: {}", &req_body.value.to_string());
         let url = Url::parse(&*url_string).unwrap();
         let library_method = match &endpoint.method {
             HttpMethod::POST => Method::POST,
@@ -209,21 +230,19 @@ impl ApiClient {
         let mut headers = HeaderMap::new();
         endpoint.headers.iter().cloned().for_each(|header| {
             headers.insert(
-                HeaderName::try_from(header.key.replace(":", "")).unwrap(),
-                HeaderValue::from_str(header.value.clone().as_str()).unwrap(),
+                HeaderName::from_bytes(&header.key.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(&header.value.as_bytes()).unwrap(),
             );
         });
-        headers.insert("cookie", HeaderValue::from_static("ajs_anonymous_id=%22c39d9e3c-eb77-43b4-a4b8-221516f1fc09%22; OPSGENIE_ACTIVE_CUSTOMER=tester22; OPSGENIE_SSO_COOKIE=47ec193b-6bff-485a-b8be-e1981b931474#da0ebb76-0d24-41c1-9e04-395f0a274247; intercom-device-id-pd3wpn56=b43b3e9e-654e-49fb-bcbc-cb330b803584; __stripe_mid=c2057271-46bc-4d04-93d3-0ecee3d70eed9d4f34; csrf-token=fb637d79-decb-43a6-ad62-04920715a71d; JSESSIONID=WbS3fKejDUogHRL1wM8luYW28lpw50q1IRXpRUDB; cloud.session.token=eyJraWQiOiJzZXNzaW9uLXNlcnZpY2UvcHJvZC0xNTkyODU4Mzk0IiwiYWxnIjoiUlMyNTYifQ.eyJhc3NvY2lhdGlvbnMiOltdLCJzdWIiOiI3MTIwMjA6OWEwMDc4YjUtNDFkOC00ZTQ0LWEwOWYtYzljNmI5NTc5NzEzIiwiZW1haWxEb21haW4iOiJraW5kb21kLmNvbSIsImltcGVyc29uYXRpb24iOltdLCJjcmVhdGVkIjoxNzMyNzkyMjIxLCJyZWZyZXNoVGltZW91dCI6MTczMzg1NjYwNSwidmVyaWZpZWQiOnRydWUsImlzcyI6InNlc3Npb24tc2VydmljZSIsInNlc3Npb25JZCI6IjIwNmJjZDRiLWY5YTUtNDMxNC04ZDg0LTc3YzgyODYyYzVkMCIsInN0ZXBVcHMiOltdLCJhdWQiOiJhdGxhc3NpYW4iLCJuYmYiOjE3MzM4NTYwMDUsImV4cCI6MTczNjQ0ODAwNSwiaWF0IjoxNzMzODU2MDA1LCJlbWFpbCI6InBpdGFjaXA0NzVAa2luZG9tZC5jb20iLCJqdGkiOiIyMDZiY2Q0Yi1mOWE1LTQzMTQtOGQ4NC03N2M4Mjg2MmM1ZDAifQ.Jf7cTt_n46iTRl0_ffHyfwLigZGOCwfFzbtuICt5Kxp3F86sOHfiKVlY-1pGqADooyWmZiw01dd21ByhWtObusmu0ogMBPATRuHxS0cviI0M0F-VVtKMHUSY-tgHneO4hixfs5qtdUwouAghXawwrFQF_0vhBAFCH0N6g94KGJ35d8Gz1kyMrIL9sx5OvAwkAiy7gE91khdhKuiQMkhrcvX6PPQFSzygjSLfT7ZALVsIDWFkJSnOc9XywqySzJNQEAneD_c1FvJLEmiN7JyIpY6mnFK8BZt4EtkHHTyygItJw50L2ECl3nXJ4hsQB0TwD6gCqa7_vOXs8bMqXMxmRw"));
-        headers.insert("csrf-token", HeaderValue::from_static("fb637d79-decb-43a6-ad62-04920715a71d"));
-        //headers.insert("cookie", build_cookie_header(&endpoint.cookies));
 
         let mut req = self.client.request(library_method, url).headers(headers);
 
-        if !req_body.value.is_null() {
+        if let Some(body) = &req_body.value {
+            println!("request body: {}", &body.to_string());
             if content_type.contains("application/x-www-form-urlencoded") {
-                req = req.form(&req_body.value);
+                req = req.form(&body);
             } else {
-                req = req.json(&req_body.value);
+                req = req.json(&body);
             }
         }
         req
