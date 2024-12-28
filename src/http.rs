@@ -2,8 +2,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::Display;
 use std::str::FromStr;
+use tracing::log::info;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReqParam {
@@ -50,7 +50,7 @@ impl Endpoint {
         headers: Vec<ReqParam>,
     ) -> Endpoint {
         let mut raw_path = path;
-        path_params.into_iter().for_each(|(param)| {
+        path_params.into_iter().for_each(|param| {
             raw_path = raw_path.replace(&param.key, &param.value);
         });
         Endpoint {
@@ -142,7 +142,6 @@ pub enum StatusError {
 #[derive(Clone)]
 pub struct ApiClient {
     client: Client,
-    auth_header: (String, String),
 }
 
 #[derive(Debug)]
@@ -170,28 +169,27 @@ impl FromStr for HttpMethod {
 }
 
 impl ApiClient {
-    pub fn new(auth_header: (String, String)) -> Self {
+    pub fn new() -> Self {
         Self {
             client: Client::new(),
-            auth_header,
         }
     }
 
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResult<Value>, HttpError> {
-        println!("will execute http request!");
+        info!("will execute http request!");
         let req = self.build_reqwest(request);
         let result = req.send().await;
         match result {
             Ok(response) => {
                 let status_code = response.status();
-                println!("http request executed, status_code: {}", status_code);
+                info!("http request executed, status_code: {}", status_code);
                 if status_code.is_success() {
                     let response_string = response.text().await.unwrap();
                     let parsed: Value = serde_json::from_str(&response_string).unwrap();
                     Ok(HttpResult::new(ResBody::new(parsed), status_code.as_u16()))
                 } else if status_code.is_client_error() {
                     let text = response.text().await.unwrap();
-                    println!("http request failed: {}", text);
+                    info!("http request failed: {}", text);
                     Err(HttpError::Status(
                         status_code.as_u16(),
                         StatusError::ClientError(text),
@@ -204,7 +202,7 @@ impl ApiClient {
                 }
             }
             Err(error) => {
-                println!("http request failed: {}", error);
+                info!("http request failed: {}", error);
                 Err(HttpError::Io(error.to_string()))
             }
         }
@@ -215,9 +213,9 @@ impl ApiClient {
         let req_body = request.req_body;
         let content_type = request.content_type.clone();
         let url_string = endpoint.to_url();
-        println!("url: {}", url_string);
-        println!("content type: {}", content_type);
-        println!("method: {:?}", endpoint.method);
+        info!("url: {}", url_string);
+        info!("content type: {}", content_type);
+        info!("method: {:?}", endpoint.method);
         let url = Url::parse(&*url_string).unwrap();
         let library_method = match &endpoint.method {
             HttpMethod::POST => Method::POST,
@@ -238,7 +236,7 @@ impl ApiClient {
         let mut req = self.client.request(library_method, url).headers(headers);
 
         if let Some(body) = &req_body.value {
-            println!("request body: {}", &body.to_string());
+            info!("request body: {}", &body.to_string());
             if content_type.contains("application/x-www-form-urlencoded") {
                 req = req.form(&body);
             } else {

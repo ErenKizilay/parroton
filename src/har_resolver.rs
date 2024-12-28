@@ -1,17 +1,11 @@
 use crate::models::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
-use crate::models::{
-    Action, Assertion, AuthHeaderValue, AuthenticationProvider, Expression, FlattenKeyPrefixType,
-    Parameter, ParameterLocation, ParameterType, TestCase,
-};
-use crate::repo::Repository;
-use futures::StreamExt;
+use crate::models::{Action, Assertion, AssertionItem, AuthHeaderValue, AuthenticationProvider, ComparisonType, Expression, FlattenKeyPrefixType, Parameter, ParameterLocation, ParameterType, TestCase};
+use crate::persistence::repo::Repository;
 use har::v1_2::{Entries, Headers, Request};
 use har::Spec;
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::str::FromStr;
 use uuid::Uuid;
 
 pub async fn build_test_case(
@@ -50,7 +44,7 @@ pub async fn build_test_case(
                 name: test_case_name.clone(),
                 description: description.clone(),
             };
-            let created_test_case = repository.create_test_case(case).await;
+            let created_test_case = repository.test_cases().create_test_case(case).await;
 
             let mut actions = vec![];
             let mut auth_headers_by_base_url: HashMap<
@@ -64,9 +58,11 @@ pub async fn build_test_case(
                 let input_parameters =
                     build_action_input(&action, &current.request, &response_indexes);
                 let output_parameters = build_output_parameters(&action, current);
+                let assertions = build_assertions(&action, i, &request_indexes, &response_indexes);
+                repository.assertions().batch_create(assertions).await;
                 actions.push(action);
-                repository.batch_create_parameters(input_parameters).await;
-                repository.batch_create_parameters(output_parameters).await;
+                repository.parameters().batch_create(input_parameters).await;
+                repository.parameters().batch_create(output_parameters).await;
                 let auth_headers = build_auth_headers(&current.request);
                 let base_url = obtain_base_url(&current.request.url.as_str());
                 auth_headers_by_base_url
@@ -74,39 +70,35 @@ pub async fn build_test_case(
                     .or_insert_with(Vec::new)
                     .push(auth_headers);
             }
-            let auth_providers = auth_headers_by_base_url
-                .iter()
-                .map(|(base_url, headers)| {
-                    let mut headers_by_name: HashMap<String, AuthHeaderValue> = HashMap::new();
-                    headers.iter().for_each(|map| {
-                        map.iter().for_each(|(k, v)| {
-                            headers_by_name.insert(k.to_string(), v.clone());
-                        })
-                    });
-                    let mut test_case_ids = HashSet::new();
-                    test_case_ids.insert(created_test_case.id.clone());
-                    AuthenticationProvider {
-                        customer_id: customer_id.clone(),
-                        id: Uuid::new_v4().to_string(),
-                        base_url: base_url.clone(),
-                        headers_by_name: headers_by_name.clone(),
-                        linked_test_case_ids: test_case_ids,
-                    }
-                })
-                .collect::<Vec<AuthenticationProvider>>();
-            repository.batch_create_auth_providers(auth_providers).await;
-            repository.batch_create_actions(actions).await;
+            create_auth_providers(repository, created_test_case, &mut auth_headers_by_base_url).await;
+            repository.actions().batch_create(actions).await;
         }
-        Spec::V1_3(log_v2) => {}
+        Spec::V1_3(_) => {}
     }
 }
 
-fn url_included(url: &String, pattern: &String) -> bool {
-    Regex::new(pattern).unwrap().is_match(url)
-}
-
-fn url_excluded(url: &String, pattern: &String) -> bool {
-    Regex::new(pattern).unwrap().is_match(url)
+async fn create_auth_providers(repository: &Repository, created_test_case: TestCase, auth_headers_by_base_url: &mut HashMap<String, Vec<HashMap<String, AuthHeaderValue>>>) {
+    let auth_providers = auth_headers_by_base_url
+        .iter()
+        .map(|(base_url, headers)| {
+            let mut headers_by_name: HashMap<String, AuthHeaderValue> = HashMap::new();
+            headers.iter().for_each(|map| {
+                map.iter().for_each(|(k, v)| {
+                    headers_by_name.insert(k.to_string(), v.clone());
+                })
+            });
+            let mut test_case_ids = HashSet::new();
+            test_case_ids.insert(created_test_case.id.clone());
+            AuthenticationProvider {
+                customer_id: created_test_case.customer_id.clone(),
+                id: Uuid::new_v4().to_string(),
+                base_url: base_url.clone(),
+                headers_by_name: headers_by_name.clone(),
+                linked_test_case_ids: test_case_ids,
+            }
+        })
+        .collect::<Vec<AuthenticationProvider>>();
+    repository.auth_providers().batch_create_auth_providers(auth_providers).await;
 }
 
 fn build_action(order: usize, test_case: &TestCase, entry: &Entries) -> Action {
@@ -229,7 +221,7 @@ fn build_action_input(
 }
 
 fn build_assertions(
-    action_name: &String,
+    action: &Action,
     order: usize,
     request_indexes: &Vec<HashMap<String, Value>>,
     response_indexes: &Vec<HashMap<String, Value>>,
@@ -244,12 +236,18 @@ fn build_assertions(
                 let expression_result =
                     resolve_value_expression_from_slice_index(&res_value, &slice);
                 if let Some(expression) = expression_result {
-                    let assertion = Assertion::EqualTo(
-                        expression,
-                        Expression {
+                    let assertion = Assertion {
+                        customer_id: action.customer_id.clone(),
+                        test_case_id: action.test_case_id.clone(),
+                        action_id: action.id.clone(),
+                        id: Uuid::new_v4().to_string(),
+                        left: AssertionItem::from_expression(expression),
+                        right: AssertionItem::from_expression(Expression {
                             value: path.to_string(),
-                        },
-                    );
+                        }),
+                        comparison_type: ComparisonType::EqualTo,
+                        negate: false,
+                    };
                     assertions.push(assertion);
                 }
             }
@@ -439,15 +437,6 @@ fn resolve_value_expression_from_prev(
     resolve_value_expression_from_slice_index(&value, prev_indexes)
 }
 
-fn resolve_value_expression_from_prev_and_equal(
-    order: usize,
-    value: &Value,
-    response_indexes: &Vec<HashMap<String, Value>>,
-) -> Option<Expression> {
-    let next_indexes: &[HashMap<String, Value>] = &response_indexes[0..=order];
-    resolve_value_expression_from_slice_index(&value, next_indexes)
-}
-
 fn resolve_value_expression_from_slice_index(
     value: &&Value,
     indexes: &[HashMap<String, Value>],
@@ -474,13 +463,13 @@ fn flatten_json_value(
             for (key, val) in map {
                 let new_prefix = if prefix_so_far.is_empty() {
                     match prefix_type {
-                        FlattenKeyPrefixType::Output => {
+                        Output => {
                             format!("$.{}.{}.{}", action_name, "output", key)
                         }
-                        FlattenKeyPrefixType::Input => {
+                        Input => {
                             format!("$.{}", key)
                         }
-                        FlattenKeyPrefixType::AssertionExpression => {
+                        AssertionExpression => {
                             format!("$.{}.{}.{}", action_name, "input", key)
                         }
                     }
@@ -502,95 +491,6 @@ fn flatten_json_value(
     }
 }
 
-/// Merges a path-value pair into the given base map
-fn merge_path(base: &mut Map<String, Value>, path: String, value: Value) {
-    let parts: Vec<&str> = path.trim_start_matches('$').split('.').collect();
-
-    let mut current = base;
-    for key in &parts[..parts.len() - 1] {
-        current = current
-            .entry(key.to_string())
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .unwrap();
-    }
-
-    current.insert(parts.last().unwrap().to_string(), value);
-}
-
-/// Merges multiple parameters into a single nested map
-fn reverse_flatten_all(path_value_pairs: Vec<(String, Value)>) -> Value {
-    let mut root = Map::new();
-    let array_key_regex = Regex::new(r"^([^\[]+)\[(\d+)\](?:\.(.+))?$").unwrap();
-
-    for (key, mut value) in path_value_pairs {
-        // Remove the leading "$." from the key
-        let key = key.strip_prefix("$.").unwrap_or(&key);
-        let parts: Vec<&str> = key.split('.').collect();
-        let mut current = &mut root;
-
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                // Last part of the key
-                if let Some(captures) = array_key_regex.captures(part) {
-                    let array_name = captures.get(1).unwrap().as_str();
-                    let array_index: usize = captures.get(2).unwrap().as_str().parse().unwrap();
-                    let nested_field = captures.get(3).map(|m| m.as_str());
-
-                    // Work on the array part
-                    let array = current
-                        .entry(array_name)
-                        .or_insert_with(|| Value::Array(vec![]));
-                    if let Value::Array(ref mut vec) = array {
-                        if vec.len() <= array_index {
-                            vec.resize(array_index + 1, Value::Object(Map::new()));
-                        }
-                        let ref mut current_array_item_val: Value = vec[array_index];
-                        if let Value::Object(ref mut obj) = current_array_item_val {
-                            if let Some(field_name) = nested_field {
-                                obj.insert(field_name.to_string(), value.clone());
-                            } else {
-                                *current_array_item_val = value.clone();
-                            }
-                        }
-                    }
-                } else {
-                    current.insert(part.to_string(), value.clone());
-                }
-            } else {
-                // Intermediate parts
-                if let Some(captures) = array_key_regex.captures(part) {
-                    let array_name = captures.get(1).unwrap().as_str();
-                    let array_index: usize = captures.get(2).unwrap().as_str().parse().unwrap();
-
-                    // Precompute array entry
-                    let array = current
-                        .entry(array_name)
-                        .or_insert_with(|| Value::Array(vec![]));
-                    current = if let Value::Array(ref mut vec) = array {
-                        if vec.len() <= array_index {
-                            vec.resize(array_index + 1, Value::Object(Map::new()));
-                        }
-                        vec[array_index]
-                            .as_object_mut()
-                            .expect("Expected an object in the array")
-                    } else {
-                        panic!("Expected an array");
-                    };
-                } else {
-                    current = current
-                        .entry(part.to_string())
-                        .or_insert_with(|| Value::Object(Map::new()))
-                        .as_object_mut()
-                        .expect("Expected an object for the intermediate part");
-                }
-            }
-        }
-    }
-
-    Value::Object(root)
-}
-
 fn is_auth_related_header(key: &String) -> bool {
     vec![
         "authorization",
@@ -602,8 +502,8 @@ fn is_auth_related_header(key: &String) -> bool {
         "cookie",
         "auth",
     ]
-    .iter()
-    .any(|x| key.contains(x))
+        .iter()
+        .any(|x| key.contains(x))
 }
 
 fn obtain_base_url(url: &str) -> String {

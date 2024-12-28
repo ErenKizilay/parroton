@@ -1,54 +1,53 @@
+use crate::api::{ApiResponse, AppError, AppState};
 use crate::execution::{run_test, RunTestCaseCommand};
 use crate::har_resolver::build_test_case;
+use crate::json_path_utils;
 use crate::json_path_utils::AutoCompleteRequest;
-use crate::models::ParameterType;
-use crate::repo::{ParameterIn, Repository};
-use crate::{json_path_utils, AppState};
+use crate::models::{Action, ActionExecution, Assertion, AssertionItem, AuthenticationProvider, ComparisonType, Expression, Parameter, ParameterType, Run, TestCase};
+use crate::persistence::repo::{ParameterIn, QueryResult, Repository};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use har::Har;
 use serde::Deserialize;
-use serde_json::Value;
 use std::io::Cursor;
 
-// The query parameters for todos index
-#[derive(Debug, Deserialize, Default)]
-pub struct Pagination {
-    pub offset: Option<usize>,
-    pub limit: Option<usize>,
-}
-
-pub async fn list_test_cases(State(repository): State<Repository>) -> impl IntoResponse {
-    let result = repository.list_test_cases("eren".to_string(), None).await;
-    (StatusCode::OK, Json(result.items))
+pub async fn list_test_cases(State(repository): State<Repository>) -> Result<ApiResponse<QueryResult<TestCase>>, AppError> {
+    let result = repository.test_cases().list("eren".to_string(), None).await;
+    ApiResponse::from(result)
 }
 
 pub async fn list_auth_providers(
     params: Query<AuthProvidersQueryParams>,
     State(repository): State<Repository>,
-) -> impl IntoResponse {
-    let result = repository
-        .list_auth_providers(&"eren".to_string(), params.test_case_id.clone(), None)
+) -> Result<ApiResponse<QueryResult<AuthenticationProvider>>, AppError> {
+    let result = repository.auth_providers()
+        .list(&"eren".to_string(), params.test_case_id.clone(), None)
         .await;
-    (StatusCode::OK, Json(result))
+    ApiResponse::from(result)
 }
 
 pub async fn get_test_case(
     Path(id): Path<String>,
     State(repository): State<Repository>,
+) -> Result<ApiResponse<TestCase>, AppError> {
+    let result = repository.test_cases().get("eren".to_string(), id).await;
+    ApiResponse::from_option(result)
+}
+
+pub async fn delete_test_case(
+    Path(id): Path<String>,
+    State(repository): State<Repository>,
 ) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(repository.get_test_case("eren".to_string(), id).await),
-    )
+    repository.test_cases().delete(&"eren".to_string(), &id).await;
+    StatusCode::NO_CONTENT
 }
 
 pub async fn run_test_case(
     Path(id): Path<String>,
     State(app_state): State<AppState>,
-) -> impl IntoResponse {
+) -> Result<ApiResponse<Run>, AppError> {
     let result = run_test(
         app_state.repository,
         app_state.api_client,
@@ -57,82 +56,80 @@ pub async fn run_test_case(
             test_case_id: id,
         },
     )
-    .await;
-    match result {
-        Ok(run) => (StatusCode::OK, Json(serde_json::json!(run))),
-        Err(err) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(Value::String(err.to_string())),
-        ),
-    }
+        .await;
+    ApiResponse::from(result)
 }
 
 pub async fn get_run(
     Path(path_params): Path<(String, String)>,
     State(app_state): State<AppState>,
-) -> impl IntoResponse {
+) -> Result<ApiResponse<Run>, AppError> {
     let result = app_state
-        .repository
-        .get_run(&"eren".to_string(), &path_params.0, &path_params.1)
+        .repository.runs()
+        .get(&"eren".to_string(), &path_params.0, &path_params.1)
         .await;
 
-    match result {
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(Value::String("run does not exist".to_string())),
-        ),
-        Some(run) => (StatusCode::OK, Json(serde_json::json!(run))),
-    }
+    ApiResponse::from_option(result)
 }
 
 pub async fn get_action_executions(
     Path(path_params): Path<(String, String)>,
     State(app_state): State<AppState>,
-) -> impl IntoResponse {
-    let executions = app_state
-        .repository
-        .get_action_executions(&"eren".to_string(), &path_params.0, &path_params.1)
+) -> Result<ApiResponse<Vec<ActionExecution>>, AppError> {
+    let result = app_state
+        .repository.action_executions()
+        .list(&"eren".to_string(), &path_params.0, &path_params.1)
         .await;
-    (StatusCode::OK, Json(executions))
+    ApiResponse::from(result)
 }
 
 pub async fn list_runs(
     Path(test_case_id): Path<String>,
     State(app_state): State<AppState>,
-) -> impl IntoResponse {
-    let executions = app_state
-        .repository
-        .list_runs(&"eren".to_string(), &test_case_id)
-        .await.items;
-    (StatusCode::OK, Json(executions))
+) -> Result<ApiResponse<QueryResult<Run>>, AppError> {
+    let result = app_state
+        .repository.runs()
+        .list(&"eren".to_string(), &test_case_id)
+        .await;
+    ApiResponse::from(result)
+}
+
+pub async fn list_assertions(
+    Path(test_case_id): Path<String>,
+    State(app_state): State<AppState>,
+) -> Result<ApiResponse<QueryResult<Assertion>>, AppError> {
+    let result = app_state
+        .repository.assertions()
+        .list(&"eren".to_string(), &test_case_id)
+        .await;
+    ApiResponse::from(result)
 }
 
 pub async fn list_actions(
     Path(test_case_id): Path<String>,
     params: Query<ActionQueryParams>,
     State(repository): State<Repository>,
-) -> impl IntoResponse {
-    let mut result = match params.before_order {
+) -> Result<ApiResponse<QueryResult<Action>>, AppError> {
+    let result = match params.before_order {
         None => {
-            repository
-                .list_actions("eren".to_string(), test_case_id.to_string(), None)
+            repository.actions()
+                .list("eren".to_string(), test_case_id.to_string(), None)
                 .await
         }
         Some(order) => {
-            repository
-                .list_previous_actions("eren".to_string(), test_case_id.to_string(), order, None)
+            repository.actions()
+                .list_previous("eren".to_string(), test_case_id.to_string(), order, None)
                 .await
         }
     };
-    result.items.sort();
-    (StatusCode::OK, Json(result.items))
+    ApiResponse::from(result)
 }
 
 pub async fn list_parameters(
     Path(path_params): Path<(String, String)>,
     params: Query<ParameterQueryParams>,
     State(repository): State<Repository>,
-) -> impl IntoResponse {
+) -> Result<ApiResponse<QueryResult<Parameter>>, AppError> {
     let test_case_id = path_params.0;
     let action_id = path_params.1;
     let parameter_type = &params.parameter_type;
@@ -140,7 +137,8 @@ pub async fn list_parameters(
         None => {
             let option = &params.parameter_in;
             repository
-                .list_parameters_of_action(
+                .parameters()
+                .list_by_action(
                     "eren".to_string(),
                     test_case_id.to_string(),
                     action_id.to_string(),
@@ -152,7 +150,8 @@ pub async fn list_parameters(
         }
         Some(path) => {
             repository
-                .query_parameters_of_action_by_path(
+                .parameters()
+                .query_by_path(
                     "eren".to_string(),
                     test_case_id.to_string(),
                     action_id.to_string(),
@@ -163,7 +162,17 @@ pub async fn list_parameters(
                 .await
         }
     };
-    (StatusCode::OK, Json(result.items))
+    ApiResponse::from(result)
+}
+
+pub async fn update_parameter_expression(
+    Path(path_params): Path<ParametersPathParam>,
+    State(repository): State<Repository>,
+    Json(expression): Json<Option<Expression>>,
+) -> Result<ApiResponse<Parameter>, AppError> {
+    let result = repository.parameters()
+        .update_expression("eren".to_string(), path_params.test_case_id, path_params.action_id, path_params.id, expression).await;
+    ApiResponse::from(result)
 }
 
 pub async fn auto_complete(
@@ -218,7 +227,7 @@ pub async fn upload_test_case(
                 &provided_description,
                 provided_excluded_path_parts.clone(),
             )
-            .await;
+                .await;
         }
         None => {}
     }
@@ -249,9 +258,24 @@ pub struct AuthProvidersQueryParams {
     test_case_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ParametersPathParam {
+    test_case_id: String,
+    action_id: String,
+    id: String,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct ParameterQueryParams {
     path: Option<String>,
     parameter_type: ParameterType,
     parameter_in: Option<ParameterIn>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AssertionRequest {
+    pub left: AssertionItem,
+    pub right: AssertionItem,
+    pub comparison_type: ComparisonType,
+    pub negate: bool,
 }
