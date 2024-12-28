@@ -1,15 +1,9 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use futures::StreamExt;
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use std::fmt::Debug;
-use std::str::FromStr;
-use std::time::{Instant, SystemTime};
-use aws_sdk_dynamodb::types::Put;
-use futures::future::Either;
-use uuid::Timestamp;
-use crate::http::{HttpError, HttpResult};
+use crate::persistence::repo::ParameterIn;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestCase {
@@ -31,7 +25,6 @@ pub enum ParameterLocation {
     Cookie(String),
     Query(String),
     Body(String),
-    StatusCode(),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -59,7 +52,7 @@ pub struct AuthenticationProvider {
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
 pub struct AuthHeaderValue {
     pub value: String,
-    pub disabled: bool
+    pub disabled: bool,
 }
 
 
@@ -77,7 +70,7 @@ pub struct Run {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum RunStatus {
     InProgress,
-    Finished
+    Finished,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -94,6 +87,7 @@ pub struct ActionExecution {
     pub query_params: Vec<(String, String)>,
     pub started_at: String,
     pub finished_at: String,
+    pub assertion_results: Vec<AssertionResult>,
 
 }
 
@@ -134,11 +128,6 @@ pub struct Expression {
     pub value: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum Assertion {
-    EqualTo(Expression, Expression),
-}
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ComparisonType {
@@ -175,12 +164,67 @@ pub struct AssertionItem {
     pub value_provider: Option<ValueProvider>,
 }
 
+impl AssertionItem {
+    pub fn from_function(function: Function) -> Self {
+        AssertionItem {
+            function: Some(function),
+            value_provider: None,
+        }
+    }
+
+    pub fn from_expression(expression: Expression) -> Self {
+        AssertionItem {
+            function: None,
+            value_provider: Some(ValueProvider {
+                expression: Some(expression),
+                value: None,
+            }),
+        }
+    }
+
+    pub fn from_value(value: Value) -> Self {
+        AssertionItem {
+            function: None,
+            value_provider: Some(ValueProvider {
+                expression: None,
+                value: Some(value),
+            }),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AssertionEntity {
+pub struct Assertion {
+    pub customer_id: String,
+    pub test_case_id: String,
+    pub action_id: String,
+    pub id: String,
     pub left: AssertionItem,
     pub right: AssertionItem,
     pub comparison_type: ComparisonType,
     pub negate: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AssertionResult {
+    pub success: bool,
+    pub message: Option<String>,
+}
+
+impl AssertionResult {
+    pub fn from_error(message: String) -> Self {
+        AssertionResult {
+            success: false,
+            message: Some(message),
+        }
+    }
+
+    pub fn of_success() -> Self {
+        AssertionResult {
+            success: true,
+            message: None,
+        }
+    }
 }
 
 pub enum FlattenKeyPrefixType {
@@ -190,14 +234,21 @@ pub enum FlattenKeyPrefixType {
 }
 
 impl Parameter {
-
     pub fn get_path(&self) -> String {
         match &self.location {
-            ParameterLocation::Header(name) => {name.clone()}
-            ParameterLocation::Cookie(name) => {name.clone()}
-            ParameterLocation::Query(name) => {name.clone()}
-            ParameterLocation::Body(name) => {name.clone()}
-            ParameterLocation::StatusCode() => {String::new()}
+            ParameterLocation::Header(name) => { name.clone() }
+            ParameterLocation::Cookie(name) => { name.clone() }
+            ParameterLocation::Query(name) => { name.clone() }
+            ParameterLocation::Body(name) => { name.clone() }
+        }
+    }
+
+    pub fn get_parameter_in(&self) -> ParameterIn {
+        match &self.location {
+            ParameterLocation::Header(_) => {ParameterIn::Header}
+            ParameterLocation::Cookie(_) => {ParameterIn::Cookie}
+            ParameterLocation::Query(_) => {ParameterIn::Query}
+            ParameterLocation::Body(_) => {ParameterIn::Body}
         }
     }
 }

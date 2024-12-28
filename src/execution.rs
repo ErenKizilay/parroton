@@ -1,18 +1,18 @@
+use crate::api::AppError;
+use crate::assertions::check_assertion;
 use crate::http::{
     ApiClient, Endpoint, HttpError, HttpMethod, HttpRequest, HttpResult, ReqBody, ReqParam,
 };
 use crate::json_path_utils::{evaluate_value, reverse_flatten_all};
-use crate::models::{Action, ActionExecution, Parameter, ParameterType, Run, RunStatus};
-use crate::repo::{ParameterIn, Repository};
+use crate::models::{Action, ActionExecution, AssertionResult, Parameter, Run, RunStatus};
+use crate::persistence::repo::{ParameterIn, Repository};
+use aws_sdk_dynamodb::primitives::DateTime;
+use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
-use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
-use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
-use serde_dynamo::AttributeValue::S;
+use tracing::info;
 use uuid::Uuid;
 
 pub struct RunTestCaseCommand {
@@ -20,67 +20,68 @@ pub struct RunTestCaseCommand {
     pub test_case_id: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum RunError {
-    #[error("test case does not exist!")]
-    TestCaseNotFound,
-}
-
 pub async fn run_test(
     repo: Arc<Repository>,
     api_client: Arc<ApiClient>,
     command: RunTestCaseCommand,
-) -> Result<Run, RunError> {
+) -> Result<Run, AppError> {
     let get_test_case_result = repo
-        .get_test_case(command.customer_id.clone(), command.test_case_id.clone())
+        .test_cases()
+        .get(command.customer_id.clone(), command.test_case_id.clone())
         .await;
     match get_test_case_result {
-        Some(test_case) => {
-            println!("Running case {}", test_case.id);
-            let run_id = Uuid::new_v4().to_string();
-            let run = repo
-                .create_run(Run {
-                    customer_id: command.customer_id.clone(),
-                    test_case_id: command.test_case_id.clone(),
-                    id: run_id,
-                    status: RunStatus::InProgress,
-                    started_at: DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap(),
-                    finished_at: None,
-                })
-                .await;
-            let cloned_run = run.clone();
-            let repo_cloned = Arc::clone(&repo);
-            let api_client_cloned = Arc::clone(&api_client);
-            tokio::spawn(async move {
-                let mut context = Map::new();
-                let mut actions = &mut repo_cloned
-                    .clone()
-                    .list_actions(test_case.customer_id, test_case.id, None)
-                    .await
-                    .items;
-                actions.sort();
-                for action in actions {
-                    execute(
-                        repo_cloned.clone(),
-                        api_client_cloned.clone(),
-                        &cloned_run,
-                        &action,
-                        &mut context,
-                    )
-                    .await;
+        Ok(test_case_option) => {
+            match test_case_option {
+                None => {
+                    Err(AppError::NotFound("Test case not found!".to_string()))
                 }
-                repo_cloned
-                    .update_run_status(
-                        &cloned_run.customer_id,
-                        &cloned_run.test_case_id,
-                        &cloned_run.id,
-                        &RunStatus::Finished,
-                    )
-                    .await;
-            });
-            Ok(run)
+                Some(test_case) => {
+                    info!("Running case {}", test_case.id);
+                    let run_id = Uuid::new_v4().to_string();
+                    let run = repo.runs()
+                        .create(Run {
+                            customer_id: command.customer_id.clone(),
+                            test_case_id: command.test_case_id.clone(),
+                            id: run_id,
+                            status: RunStatus::InProgress,
+                            started_at: DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap(),
+                            finished_at: None,
+                        })
+                        .await;
+                    let cloned_run = run.clone();
+                    let repo_cloned = Arc::clone(&repo);
+                    let api_client_cloned = Arc::clone(&api_client);
+                    tokio::spawn(async move {
+                        let mut context = Map::new();
+                        let mut actions = &mut repo_cloned
+                            .clone().actions()
+                            .list(test_case.customer_id, test_case.id, None)
+                            .await
+                            .unwrap().items;
+                        actions.sort();
+                        for action in actions {
+                            execute(
+                                repo_cloned.clone(),
+                                api_client_cloned.clone(),
+                                &cloned_run,
+                                &action,
+                                &mut context)
+                                .await;
+                        }
+                        repo_cloned.runs()
+                            .update(
+                                &cloned_run.customer_id,
+                                &cloned_run.test_case_id,
+                                &cloned_run.id,
+                                &RunStatus::Finished,
+                            )
+                            .await;
+                    });
+                    Ok(run)
+                }
+            }
         }
-        None => Err(RunError::TestCaseNotFound),
+        Err(err) => Err(err)
     }
 }
 
@@ -91,7 +92,7 @@ async fn execute(
     action: &Action,
     context: &mut Map<String, Value>,
 ) {
-    println!(
+    info!(
         "will execute action: {}, {:?}",
         action.name.clone(),
         SystemTime::now()
@@ -107,7 +108,7 @@ async fn execute(
     let request_body = resolve_request_body_from_request(&http_request);
     let req_params = resolve_request_params_from_request(&http_request);
     let result = client.execute(http_request).await;
-    println!(
+    info!(
         "executed action: {}, {:?}",
         action.name.clone(),
         SystemTime::now()
@@ -120,9 +121,17 @@ async fn execute(
     let status_code = resolve_status_code(&result);
     let error = resolve_error_from_result(&result);
     let response_body = resolve_response_from_result(&result);
+    let assertion_context = Value::Object(context.clone());
     tokio::spawn(async move {
+        let assertions = arc_repo_clone.assertions()
+            .list(&run_cloned.customer_id.clone(), &run_cloned.test_case_id.clone()).await
+            .unwrap().items;
+        let assertion_results: Vec<AssertionResult> = assertions.iter()
+            .map(|assertion| { check_assertion(assertion, &assertion_context) })
+            .collect();
         arc_repo_clone
-            .create_action_execution(ActionExecution {
+            .action_executions()
+            .create(ActionExecution {
                 run_id: run_cloned.id.clone(),
                 customer_id: run_cloned.customer_id.clone(),
                 test_case_id: run_cloned.test_case_id.clone(),
@@ -135,6 +144,7 @@ async fn execute(
                 response_body,
                 request_body,
                 query_params: req_params,
+                assertion_results,
             })
             .await;
     });
@@ -167,7 +177,7 @@ fn resolve_status_code(result: &Result<HttpResult<Value>, HttpError>) -> u16 {
     match result {
         Ok(http_result) => http_result.status_code,
         Err(err) => match err {
-            HttpError::Status(status_error, err) => status_error.clone(),
+            HttpError::Status(status_error, _) => status_error.clone(),
             HttpError::Io(_) => 0,
         },
     }
@@ -186,7 +196,7 @@ fn resolve_response_from_result(result: &Result<HttpResult<Value>, HttpError>) -
 
 fn resolve_error_from_result(result: &Result<HttpResult<Value>, HttpError>) -> Option<String> {
     match result {
-        Ok(http_result) => None,
+        Ok(_) => None,
         Err(err) => Some(err.get_message()),
     }
 }
@@ -196,15 +206,19 @@ async fn build_http_request(
     action: &Action,
     context: &Value,
 ) -> HttpRequest {
-    let req_params = build_http_params(repository, action, context, ParameterIn::Query).await;
-    let mut headers = build_http_params(repository, action, context, ParameterIn::Header).await;
-    repository
-        .list_auth_providers(
+    let parameters = repository.parameters().list_all_inputs_of_action(action.customer_id.clone(), action.test_case_id.clone(), action.id.clone())
+        .await
+        .unwrap();
+    let req_params = build_http_params(&parameters, context, ParameterIn::Query).await;
+    let mut headers = build_http_params(&parameters, context, ParameterIn::Header).await;
+    repository.auth_providers()
+        .list(
             &action.customer_id,
             Some(action.test_case_id.clone()),
             Some(obtain_base_url(&action.url)),
         )
         .await
+        .unwrap().items
         .iter()
         .for_each(|provider| {
             provider
@@ -215,7 +229,7 @@ async fn build_http_request(
                     headers.push(ReqParam::new(key.clone(), value.value.clone()))
                 })
         });
-    let req_body = build_http_request_body(repository, action, context).await;
+    let req_body = build_http_request_body(&parameters, context).await;
     let endpoint = Endpoint::new(
         HttpMethod::from_str(&action.method).unwrap(),
         action.url.clone(),
@@ -234,23 +248,13 @@ async fn build_http_request(
 }
 
 async fn build_http_params(
-    repository: &Repository,
-    action: &Action,
+    parameters: &Vec<Parameter>,
     context: &Value,
     parameter_in: ParameterIn,
 ) -> Vec<ReqParam> {
-    repository
-        .list_parameters_of_action(
-            action.customer_id.clone(),
-            action.test_case_id.clone(),
-            action.id.clone(),
-            ParameterType::Input,
-            Some(parameter_in),
-            None,
-        )
-        .await
-        .items
+    parameters
         .iter()
+        .filter(|param| { param.get_parameter_in() == parameter_in })
         .map(|parameter: &Parameter| (parameter, evaluate_value(parameter, context)))
         .filter(|(parameter, eval_result)| {
             if let Err(err) = eval_result {
@@ -277,22 +281,12 @@ async fn build_http_params(
 }
 
 async fn build_http_request_body(
-    repository: &Repository,
-    action: &Action,
+    parameters: &Vec<Parameter>,
     context: &Value,
 ) -> ReqBody {
-    let tuples: Vec<(String, Value)> = repository
-        .list_parameters_of_action(
-            action.customer_id.clone(),
-            action.test_case_id.clone(),
-            action.id.clone(),
-            ParameterType::Input,
-            Some(ParameterIn::Body),
-            None,
-        )
-        .await
-        .items
+    let tuples: Vec<(String, Value)> = parameters
         .iter()
+        .filter(|p| { p.get_parameter_in() == ParameterIn::Body })
         .map(|parameter: &Parameter| (parameter, evaluate_value(parameter, context)))
         .filter(|(parameter, eval_result)| {
             if let Err(err) = eval_result {

@@ -1,10 +1,10 @@
-use crate::models::{Parameter, ParameterType};
-use crate::repo::Repository;
-use futures::FutureExt;
+use crate::models::{Expression, Parameter, ParameterType};
+use crate::persistence::repo::Repository;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use serde_json_path::JsonPath;
+use tracing::info;
 
 #[derive(Deserialize)]
 pub struct AutoCompleteRequest {
@@ -16,7 +16,7 @@ pub struct AutoCompleteRequest {
     latest_input: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum SuggestionStrategy {
     ActionNames,
     InputOrOutput,
@@ -24,33 +24,23 @@ enum SuggestionStrategy {
 }
 
 pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest) -> Vec<String> {
-    let regexes: Vec<(SuggestionStrategy, Regex)> = vec![
-        (
-            SuggestionStrategy::ActionNames,
-            Regex::new(r"^(\$.)$").unwrap(),
-        ),
-        (
-            SuggestionStrategy::InputOrOutput,
-            Regex::new(r"(^\$\.([a-zA-Z0-9_]+)$)").unwrap(),
-        ),
-        (
-            SuggestionStrategy::JsonPath,
-            Regex::new(r"(output|input)").unwrap(),
-        ),
-    ];
-
-    for (strategy, regex) in regexes {
-        if regex.is_match(&request.latest_input) {
-            println!("matched strategy: {:?} for input {}", strategy, request.latest_input);
-            let suggestions = match strategy {
+    let strategy_option = find_matching_suggestion_strategy(&request.latest_input);
+    match strategy_option {
+        None => {
+            vec![]
+        }
+        Some(strategy) => {
+            match strategy {
                 SuggestionStrategy::ActionNames => repository
-                    .list_previous_actions(
+                    .actions()
+                    .list_previous(
                         request.customer_id.clone(),
                         request.test_case_id.clone(),
                         request.source_action_order,
                         None,
                     )
                     .await
+                    .unwrap()
                     .items
                     .iter()
                     .map(|a| a.name.clone())
@@ -70,8 +60,9 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                         "$.".to_string(),
                         ".".to_string(),
                     );
-                    println!("target_action_name: {}", target_action_name);
+                    info!("target_action_name: {}", target_action_name);
                     let target_action = repository
+                        .actions()
                         .get_action_by_name(
                             request.customer_id.clone(),
                             request.test_case_id.clone(),
@@ -80,7 +71,8 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                         .await
                         .unwrap();
                     repository
-                        .query_parameters_of_action_by_path(
+                        .parameters()
+                        .query_by_path(
                             request.customer_id.clone(),
                             request.test_case_id.clone(),
                             target_action.id,
@@ -89,17 +81,16 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                             None,
                         )
                         .await
+                        .unwrap()
                         .items
                         .iter()
                         .map(|p| p.get_path()
                         )
                         .collect()
                 }
-            };
-            return suggestions;
-        } else { println!("no suggestion for input {}", request.latest_input); }
+            }
+        }
     }
-    vec![]
 }
 
 fn substring_between(input: String, start: String, end: String) -> String {
@@ -120,25 +111,42 @@ pub fn evaluate_value(parameter: &Parameter, context: &Value) -> Result<Value, S
     let result = match &parameter.value_expression {
         None => Ok(parameter.value.clone()),
         Some(exp) => {
-            let json_path = JsonPath::parse(exp.value.as_str()).unwrap();
-            let node_list = json_path.query(context);
-            if parameter.value.is_array() {
-                let values: Vec<Value> = node_list
-                    .all()
-                    .iter()
-                    .cloned()
-                    .map(|node| node.clone())
-                    .collect();
-                Ok(Value::Array(values))
-            } else {
-                match node_list.exactly_one() {
-                    Ok(val) => Ok(val.clone()),
-                    Err(err) => Err(err.to_string()),
+            let eval_result = evaluate_expression(context, exp);
+            match eval_result {
+                Ok(values) => {
+                    if parameter.value.is_array() {
+                        Ok(Value::Array(values))
+                    } else {
+                        match values.iter().next() {
+                            Some(val) => Ok(val.clone()),
+                            None => Err(format!("expression \"{}\" produces empty result", exp.value)),
+                        }
+                    }
+                }
+                Err(err) => {
+                    Err(err)
                 }
             }
         }
     };
     result
+}
+
+pub fn evaluate_expression(context: &Value, exp: &Expression) -> Result<Vec<Value>, String> {
+    let json_path_result = JsonPath::parse(exp.value.as_str());
+    match json_path_result {
+        Ok(json_path) => {
+            Ok(json_path.query(context)
+                .all()
+                .iter()
+                .cloned()
+                .map(|node| node.clone())
+                .collect())
+        }
+        Err(err) => {
+            Err(err.to_string())
+        }
+    }
 }
 
 pub fn reverse_flatten_all(path_value_pairs: Vec<(String, Value)>) -> Value {
@@ -215,21 +223,45 @@ pub fn reverse_flatten_all(path_value_pairs: Vec<(String, Value)>) -> Value {
 
 fn remove_prefix(s: &String, pattern: &str) -> String {
     let regex = Regex::new("^((.*).(output|input)\\.)").unwrap();
-    println!("s: [{}] p: {}", s, pattern);
+    info!("s: [{}] p: {}", s, pattern);
     format!(
         "$.{}",
         regex
             .captures(s.as_str())
             .iter()
             .map(|caps| {
-                println!("caps: {:?}", caps);
-                println!("cap 1: {:?}", caps.get(1).unwrap().as_str());
+                info!("caps: {:?}", caps);
+                info!("cap 1: {:?}", caps.get(1).unwrap().as_str());
                 s.strip_prefix(caps.get(1).unwrap().as_str().trim_matches('"'))
                     .unwrap_or(s.as_str())
             })
             .next()
             .unwrap_or("")
     )
+}
+
+fn find_matching_suggestion_strategy(input: &String) -> Option<SuggestionStrategy> {
+    let regexes: Vec<(SuggestionStrategy, Regex)> = vec![
+        (
+            SuggestionStrategy::ActionNames,
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*)").unwrap(),
+        ),
+        (
+            SuggestionStrategy::InputOrOutput,
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*\.([a-z]*))").unwrap(),
+        ),
+        (
+            SuggestionStrategy::JsonPath,
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*\.([a-z]*))\.(.*)").unwrap(),
+        ),
+    ];
+    for (strategy, regex) in regexes {
+        let replace_result = regex.replace_all(input.as_str(), "");
+        if replace_result.len() == 0 {
+            return Some(strategy);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -253,5 +285,33 @@ mod tests {
             .next()
             .unwrap_or("");
         println!("result: {:?}", x);
+    }
+
+    #[test]
+    fn matching() {
+        let input1 = String::from("$.");
+        let input2 = String::from("$.action");
+        let input3 = String::from("$.action.");
+        let input4 = String::from("$.action.out");
+        let input5 = String::from("$.action.output.");
+        let input6 = String::from("$.action.output.param");
+
+        let actual1 = find_matching_suggestion_strategy(&input1);
+        assert_eq!(actual1, Some(SuggestionStrategy::ActionNames));
+
+        let actual2 = find_matching_suggestion_strategy(&input2);
+        assert_eq!(actual2, Some(SuggestionStrategy::ActionNames));
+
+        let actual3 = find_matching_suggestion_strategy(&input3);
+        assert_eq!(actual3, Some(SuggestionStrategy::InputOrOutput));
+
+        let actual4 = find_matching_suggestion_strategy(&input4);
+        assert_eq!(actual4, Some(SuggestionStrategy::InputOrOutput));
+
+        let actual5 = find_matching_suggestion_strategy(&input5);
+        assert_eq!(actual5, Some(SuggestionStrategy::JsonPath));
+
+        let actual6 = find_matching_suggestion_strategy(&input6);
+        assert_eq!(actual6, Some(SuggestionStrategy::JsonPath));
     }
 }
