@@ -94,11 +94,9 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
 }
 
 fn substring_between(input: String, start: String, end: String) -> String {
-    // First, split the string into two parts based on the start substring
     input
         .split_once(start.as_str())
         .and_then(|(_, after_start)| {
-            // Then, split the resulting string again based on the end substring
             after_start
                 .split_once(end.as_str())
                 .map(|(before_end, _)| before_end)
@@ -267,28 +265,8 @@ fn find_matching_suggestion_strategy(input: &String) -> Option<SuggestionStrateg
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Import the current module's items for testing.
     #[test]
-    fn test() {
-        let string = "$.apiIntegrations_0.output.asdasd".to_string();
-        let regex = Regex::new("^((.*).(output|input)\\.)").unwrap();
-        let x = regex
-            .captures(string.as_str())
-            .iter()
-            .map(|caps| {
-                println!("caps: {:?}", caps);
-                println!("cap 1: {:?}", caps.get(1).unwrap().as_str());
-                string
-                    .strip_prefix(caps.get(1).unwrap().as_str().trim_matches('"'))
-                    .unwrap_or(string.as_str())
-            })
-            .next()
-            .unwrap_or("");
-        println!("result: {:?}", x);
-    }
-
-    #[test]
-    fn matching() {
+    fn auto_complete_matching_strategy() {
         let input1 = String::from("$.");
         let input2 = String::from("$.action");
         let input3 = String::from("$.action.");

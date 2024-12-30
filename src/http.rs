@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::str::FromStr;
 use tracing::log::info;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ReqParam {
     pub key: String,
     pub value: String,
@@ -35,10 +35,10 @@ impl ReqBody {
 }
 
 pub struct Endpoint {
-    method: HttpMethod,
-    path: String,
+    pub method: HttpMethod,
+    pub path: String,
     pub query_params: Vec<ReqParam>,
-    headers: Vec<ReqParam>,
+    pub headers: Vec<ReqParam>,
 }
 
 impl Endpoint {
@@ -89,6 +89,10 @@ impl HttpRequest {
             req_body,
             content_type,
         }
+    }
+
+    pub fn get_body(&self) -> Option<Value> {
+        self.req_body.value.clone()
     }
 }
 
@@ -151,6 +155,18 @@ pub enum HttpMethod {
     PUT,
     PATCH,
     DELETE,
+}
+
+impl ToString for HttpMethod {
+    fn to_string(&self) -> String {
+        match self {
+            HttpMethod::POST => "POST".to_string(),
+            HttpMethod::GET => "GET".to_string(),
+            HttpMethod::PUT => "PUT".to_string(),
+            HttpMethod::PATCH => "PATCH".to_string(),
+            HttpMethod::DELETE => "DELETE".to_string(),
+        }
+    }
 }
 
 impl FromStr for HttpMethod {
