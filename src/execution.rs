@@ -209,8 +209,8 @@ async fn build_http_request(
     let parameters = repository.parameters().list_all_inputs_of_action(action.customer_id.clone(), action.test_case_id.clone(), action.id.clone())
         .await
         .unwrap();
-    let req_params = build_http_params(&parameters, context, ParameterIn::Query).await;
-    let mut headers = build_http_params(&parameters, context, ParameterIn::Header).await;
+    let req_params = build_http_params(&parameters, context, ParameterIn::Query);
+    let mut headers = build_http_params(&parameters, context, ParameterIn::Header);
     repository.auth_providers()
         .list(
             &action.customer_id,
@@ -229,7 +229,7 @@ async fn build_http_request(
                     headers.push(ReqParam::new(key.clone(), value.value.clone()))
                 })
         });
-    let req_body = build_http_request_body(&parameters, context).await;
+    let req_body = build_http_request_body(&parameters, context);
     let endpoint = Endpoint::new(
         HttpMethod::from_str(&action.method).unwrap(),
         action.url.clone(),
@@ -247,7 +247,7 @@ async fn build_http_request(
     )
 }
 
-async fn build_http_params(
+fn build_http_params(
     parameters: &Vec<Parameter>,
     context: &Value,
     parameter_in: ParameterIn,
@@ -280,7 +280,7 @@ async fn build_http_params(
         .collect()
 }
 
-async fn build_http_request_body(
+fn build_http_request_body(
     parameters: &Vec<Parameter>,
     context: &Value,
 ) -> ReqBody {
@@ -324,4 +324,103 @@ fn obtain_base_url(url: &str) -> String {
 
     // If no scheme is found, return the input as is
     url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Expression, ParameterLocation, ParameterType};
+    use serde_json::json;
+    #[test]
+    fn test_build_request_body() {
+        let param_with_expression = Parameter {
+            customer_id: "".to_string(),
+            test_case_id: "".to_string(),
+            action_id: "".to_string(),
+            id: "".to_string(),
+            parameter_type: ParameterType::Input,
+            location: ParameterLocation::Body(String::from("$.x.y.z")),
+            value: Default::default(),
+            value_expression: Some(Expression {
+                value: String::from("$.action1.output.aMap.inner.aField"),
+            }),
+        };
+        let param_with_no_expression = Parameter {
+            customer_id: "".to_string(),
+            test_case_id: "".to_string(),
+            action_id: "".to_string(),
+            id: "".to_string(),
+            parameter_type: ParameterType::Input,
+            location: ParameterLocation::Body(String::from("$.aList[0]")),
+            value: json!("anItem"),
+            value_expression: None,
+        };
+        let parameters = vec![param_with_expression, param_with_no_expression];
+        let context = json!({
+            "action1": {
+                "output": {
+                    "aMap": {
+                        "inner": {
+                            "aField": "val1"
+                        }
+                    }
+                }
+            }
+        });
+        let actual = build_http_request_body(&parameters, &context);
+        println!("actual: {:?}", actual.value);
+        assert_eq!(actual.value.is_some(), true);
+        assert_eq!(actual.value.unwrap(), json!({
+            "x": {
+                "y": {
+                    "z": "val1"
+                }
+            },
+            "aList": ["anItem"]
+        }))
+    }
+
+    #[test]
+    fn test_build_http_param() {
+        let param_with_expression = Parameter {
+            customer_id: "".to_string(),
+            test_case_id: "".to_string(),
+            action_id: "".to_string(),
+            id: "".to_string(),
+            parameter_type: ParameterType::Input,
+            location: ParameterLocation::Query(String::from("nextPage")),
+            value: Default::default(),
+            value_expression: Some(Expression {
+                value: String::from("$.action1.output.pageKey"),
+            }),
+        };
+        let param_with_no_expression = Parameter {
+            customer_id: "".to_string(),
+            test_case_id: "".to_string(),
+            action_id: "".to_string(),
+            id: "".to_string(),
+            parameter_type: ParameterType::Input,
+            location: ParameterLocation::Header(String::from("x-header1")),
+            value: json!("header-val1"),
+            value_expression: None,
+        };
+        let parameters = vec![param_with_expression, param_with_no_expression];
+        let context = json!({
+            "action1": {
+                "output": {
+                    "pageKey": "p123"
+                }
+            }
+        });
+        let actual_query_params = build_http_params(&parameters, &context, ParameterIn::Query);
+        let actual_header_params = build_http_params(&parameters, &context, ParameterIn::Header);
+        assert_eq!(actual_query_params, vec![ReqParam {
+            key: "nextPage".to_string(),
+            value: "p123".to_string(),
+        }]);
+        assert_eq!(actual_header_params, vec![ReqParam {
+            key: "x-header1".to_string(),
+            value: "header-val1".to_string(),
+        }]);
+    }
 }

@@ -7,6 +7,7 @@ mod execution;
 mod assertions;
 mod persistence;
 mod api;
+mod proxy;
 
 use crate::api::build_api;
 

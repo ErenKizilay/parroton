@@ -58,7 +58,7 @@ pub async fn build_test_case(
                 let input_parameters =
                     build_action_input(&action, &current.request, &response_indexes);
                 let output_parameters = build_output_parameters(&action, current);
-                let assertions = build_assertions(&action, i, &request_indexes, &response_indexes);
+                let assertions = build_assertions(&action, &request_indexes, &response_indexes);
                 repository.assertions().batch_create(assertions).await;
                 actions.push(action);
                 repository.parameters().batch_create(input_parameters).await;
@@ -133,18 +133,30 @@ fn build_response_index(order: usize, entry: &Entries) -> HashMap<String, Value>
     let content = &response.content;
     let option = &content.text;
     option.as_ref().map_or(HashMap::new(), |text| {
-        let mut result = HashMap::<String, Value>::new();
-        let response_value = serde_json::from_str::<Value>(&text).unwrap();
         let action_name = build_action_name(order, &entry.request);
-        flatten_json_value(
-            &action_name,
-            &Output,
-            &response_value,
-            "".to_string(),
-            &mut result,
-        );
-        result
+        let response_value = serde_json::from_str::<Value>(&text).unwrap();
+        build_response_index_from_value(&action_name, &response_value)
     })
+}
+
+pub fn build_response_index_from_value(action_name: &String, response_value: &Value) -> HashMap<String, Value> {
+    build_index_from_value(action_name, response_value, Output)
+}
+
+pub fn build_request_index_from_value(action_name: &String, input_map: &Value) -> HashMap<String, Value> {
+    build_index_from_value(action_name, input_map, AssertionExpression)
+}
+
+fn build_index_from_value(action_name: &String, response_value: &Value, flatten_key_prefix_type: FlattenKeyPrefixType) -> HashMap<String, Value> {
+    let mut result = HashMap::<String, Value>::new();
+    flatten_json_value(
+        &action_name,
+        &flatten_key_prefix_type,
+        &response_value,
+        "".to_string(),
+        &mut result,
+    );
+    result
 }
 
 fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
@@ -153,25 +165,31 @@ fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
     let option = &content.text;
     let mut parameters = vec![];
     option.as_ref().iter().for_each(|text| {
-        let mut result = HashMap::<String, Value>::new();
         let response_value = serde_json::from_str::<Value>(&text).unwrap();
-        flatten_json_value(
-            &action.name,
-            &Input,
-            &response_value,
-            "".to_string(),
-            &mut result,
+        parameters.extend(build_output_parameters_from_value(&action, &response_value));
+    });
+    parameters
+}
+
+pub fn build_output_parameters_from_value(action: &Action, response_value: &Value) -> Vec<Parameter> {
+    let mut parameters = vec![];
+    let mut result = HashMap::<String, Value>::new();
+    flatten_json_value(
+        &action.name,
+        &Input,
+        &response_value,
+        "".to_string(),
+        &mut result,
+    );
+    result.iter().for_each(|(key, value)| {
+        let parameter = build_parameter(
+            action,
+            None,
+            value.clone(),
+            ParameterLocation::Body(key.to_string()),
+            ParameterType::Output,
         );
-        result.iter().for_each(|(key, value)| {
-            let parameter = build_parameter(
-                action,
-                None,
-                value.clone(),
-                ParameterLocation::Body(key.to_string()),
-                ParameterType::Output,
-            );
-            parameters.push(parameter);
-        });
+        parameters.push(parameter);
     });
     parameters
 }
@@ -185,13 +203,7 @@ fn build_request_index(order: usize, entry: &Entries) -> HashMap<String, Value> 
             if post_data.mime_type.contains("application/json") {
                 let input_map = serde_json::from_str::<Value>(text).unwrap();
                 let action_name = build_action_name(order, &request);
-                flatten_json_value(
-                    &action_name,
-                    &AssertionExpression,
-                    &input_map,
-                    "".to_string(),
-                    &mut result,
-                );
+                result = build_request_index_from_value(&action_name, &input_map);
             }
         }
     }
@@ -199,7 +211,12 @@ fn build_request_index(order: usize, entry: &Entries) -> HashMap<String, Value> 
 }
 
 fn build_action_name(order: usize, request: &Request) -> String {
-    let formatted_name = request.url.replace("-", "_");
+    let url = &request.url;
+    build_action_name_from_url(order, url)
+}
+
+pub fn build_action_name_from_url(order: usize, url: &String) -> String {
+    let formatted_name = url.replace("-", "_");
     let base_name = formatted_name.split("/").last().unwrap();
     let re = Regex::new(r"\?.*$").unwrap(); // Matches '?' and everything after it
     format!("{}_{}", re.replace(base_name, "").to_string(), order)
@@ -220,18 +237,17 @@ fn build_action_input(
     query_params
 }
 
-fn build_assertions(
+pub fn build_assertions(
     action: &Action,
-    order: usize,
     request_indexes: &Vec<HashMap<String, Value>>,
     response_indexes: &Vec<HashMap<String, Value>>,
 ) -> Vec<Assertion> {
     let mut assertions: Vec<Assertion> = vec![];
 
-    response_indexes.get(order).iter().for_each(|response| {
+    response_indexes.get(action.order).iter().for_each(|response| {
         response.iter().for_each(|(path, res_value)| {
             if should_build_assertion_for_response_value(res_value) {
-                let mut slice = request_indexes[0..order].to_vec();
+                let mut slice = request_indexes[0..action.order].to_vec();
                 slice.reverse();
                 let expression_result =
                     resolve_value_expression_from_slice_index(&res_value, &slice);
@@ -272,26 +288,7 @@ fn build_body_parameters(
     request.post_data.as_ref().inspect(|post_data| {
         if let Some(content) = &post_data.text {
             if let Ok(value) = serde_json::from_str::<Value>(content) {
-                let mut flatten_result: HashMap<String, Value> = HashMap::new();
-                flatten_json_value(
-                    &build_action_name(action.order, request),
-                    &Input,
-                    &value,
-                    "".to_string(),
-                    &mut flatten_result,
-                );
-                flatten_result.iter().for_each(|(key, value)| {
-                    let expression_result =
-                        resolve_value_expression_from_prev(action.order, &value, response_indexes);
-                    let parameter = build_parameter(
-                        action,
-                        expression_result,
-                        value.clone(),
-                        ParameterLocation::Body(key.to_string()),
-                        ParameterType::Input,
-                    );
-                    parameters.push(parameter);
-                })
+                parameters.extend(build_body_parameters_from_value(&action, response_indexes, &value));
             }
         }
         if let Some(params) = &post_data.params {
@@ -318,6 +315,31 @@ fn build_body_parameters(
     parameters
 }
 
+pub fn build_body_parameters_from_value(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, value: &Value) -> Vec<Parameter> {
+    let mut parameters: Vec<Parameter> = vec![];
+    let mut flatten_result: HashMap<String, Value> = HashMap::new();
+    flatten_json_value(
+        &action.name,
+        &Input,
+        &value,
+        "".to_string(),
+        &mut flatten_result,
+    );
+    flatten_result.iter().for_each(|(key, value)| {
+        let expression_result =
+            resolve_value_expression_from_prev(action.order, &value, response_indexes);
+        let parameter = build_parameter(
+            action,
+            expression_result,
+            value.clone(),
+            ParameterLocation::Body(key.to_string()),
+            ParameterType::Input,
+        );
+        parameters.push(parameter);
+    });
+    parameters
+}
+
 fn build_query_parameters(
     action: &Action,
     request: &Request,
@@ -325,20 +347,28 @@ fn build_query_parameters(
 ) -> Vec<Parameter> {
     let mut parameters: Vec<Parameter> = vec![];
     request.query_string.iter().for_each(|query_string| {
-        let expression = resolve_value_expression_from_prev(
-            action.order,
-            &Value::String(query_string.value.clone()),
-            response_indexes,
-        );
-        parameters.push(build_parameter(
-            action,
-            expression,
-            Value::String(query_string.value.clone()),
-            ParameterLocation::Query(query_string.name.clone()),
-            ParameterType::Input,
-        ));
+        let query_string_value = &query_string.value;
+        let query_key = &query_string.name;
+        let parameter = build_query_param(action, response_indexes, query_string_value, query_key);
+        parameters.push(parameter);
     });
     parameters
+}
+
+pub fn build_query_param(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, query_string_value: &String, query_key: &String) -> Parameter {
+    let expression = resolve_value_expression_from_prev(
+        action.order,
+        &Value::String(query_string_value.clone()),
+        response_indexes,
+    );
+    let parameter = build_parameter(
+        action,
+        expression,
+        Value::String(query_string_value.clone()),
+        ParameterLocation::Query(query_key.clone()),
+        ParameterType::Input,
+    );
+    parameter
 }
 
 fn build_parameter(
@@ -369,22 +399,32 @@ fn build_header_parameters(
     request
         .headers
         .iter()
-        .filter(|header| !is_auth_related_header(&header.name))
         .for_each(|header| {
-            let expression = resolve_value_expression_from_prev(
-                action.order,
-                &Value::String(header.value.clone()),
-                response_indexes,
-            );
-            parameters.push(build_parameter(
-                action,
-                expression,
-                Value::String(header.value.clone()),
-                ParameterLocation::Header(resolve_header_name(header)),
-                ParameterType::Input,
-            ));
+            if let Some(parameter) = build_header_parameter(action, response_indexes, &resolve_header_name(header), &header.value) {
+                parameters.push(parameter);
+            }
         });
     parameters
+}
+
+fn build_header_parameter(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, header_name: &String, header_val: &String) -> Option<Parameter> {
+    if is_auth_related_header(&header_name) {
+        None
+    } else {
+        let expression = resolve_value_expression_from_prev(
+            action.order,
+            &Value::String(header_val.clone()),
+            response_indexes,
+        );
+
+        Some(build_parameter(
+            action,
+            expression,
+            Value::String(header_val.clone()),
+            ParameterLocation::Header(header_name.clone()),
+            ParameterType::Input,
+        ))
+    }
 }
 
 fn build_auth_headers(request: &Request) -> HashMap<String, AuthHeaderValue> {
