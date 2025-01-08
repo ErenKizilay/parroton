@@ -13,7 +13,7 @@ use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::operation::query::{QueryError, QueryOutput};
 use aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
-use aws_sdk_dynamodb::types::{AttributeValue, ComparisonOperator, Condition, DeleteRequest, PutRequest, WriteRequest};
+use aws_sdk_dynamodb::types::{AttributeValue, ComparisonOperator, Condition, DeleteRequest, KeysAndAttributes, PutRequest, WriteRequest};
 use aws_sdk_dynamodb::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use serde_dynamo::aws_sdk_dynamodb_1::to_item;
 use serde_dynamo::{from_attribute_value, from_item};
 use std::collections::HashMap;
 use std::sync::Arc;
+use aws_sdk_dynamodb::operation::batch_get_item::{BatchGetItemError, BatchGetItemOutput};
 use tokio::sync::mpsc::Sender;
 
 pub struct PageKey {
@@ -185,6 +186,33 @@ where
         client.update_item().table_name(Self::table_name())
     }
 
+    async fn batch_get_items(client: Arc<Client>, key_pairs: Vec<(String, String)>) -> Result<Vec<T>, AppError> {
+        let keys = key_pairs.iter()
+            .map(|key_pair| { Self::unique_key(key_pair.0.clone(), key_pair.1.clone()) })
+            .collect();
+        let table_name = Self::table_name();
+        let result = client.batch_get_item()
+            .request_items(&table_name, KeysAndAttributes::builder()
+                .consistent_read(true)
+                .set_keys(Some(keys))
+                .build().unwrap())
+            .send().await;
+        match result {
+            Ok(batch_get_item_output) => {
+                batch_get_item_output.responses
+                    .map_or(Ok(vec![]), |items_by_table|{
+                        Ok(items_by_table.get(&table_name).unwrap()
+                            .iter()
+                            .map(|item|{from_item(item.clone()).unwrap()})
+                            .collect())
+                        })
+            }
+            Err(err) => {
+                Err(AppError::Internal(err.to_string()))
+            }
+        }
+    }
+
     fn from_query_result(
         result: Result<QueryOutput, SdkError<QueryError, HttpResponse>>,
     ) -> Result<QueryResult<T>, AppError> {
@@ -243,6 +271,9 @@ where
                 }
             }
             if app_error.is_some() {
+                break;
+            }
+            if next_page_key.is_none() {
                 break;
             }
         }

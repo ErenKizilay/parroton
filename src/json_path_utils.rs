@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use serde_json_path::JsonPath;
 use tracing::info;
+use tracing_subscriber::fmt::format;
 
 #[derive(Deserialize)]
 pub struct AutoCompleteRequest {
@@ -25,6 +26,7 @@ enum SuggestionStrategy {
 
 pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest) -> Vec<String> {
     let strategy_option = find_matching_suggestion_strategy(&request.latest_input);
+    println!("input: {:?}, stg: {:?}", request.latest_input, strategy_option);
     match strategy_option {
         None => {
             vec![]
@@ -43,10 +45,12 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                     .unwrap()
                     .items
                     .iter()
-                    .map(|a| a.name.clone())
+                    .map(|a| format!("$.{}", a.name))
                     .collect(),
                 SuggestionStrategy::InputOrOutput => {
-                    vec!["input".to_string(), "output".to_string()]
+                    let input_parts = request.latest_input.split(".").collect::<Vec<&str>>();
+                    vec![format!("{}.{}.{}", input_parts[0], input_parts[1], "input".to_string()),
+                         format!("{}.{}.{}", input_parts[0], input_parts[1], "output".to_string())]
                 }
                 SuggestionStrategy::JsonPath => {
                     let param_type = if request.latest_input.contains("output.") {
@@ -70,6 +74,10 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                         )
                         .await
                         .unwrap();
+                    let prefix_pattern = "^((.*).(output|input)\\.)";
+                    let suffix = remove_prefix(&request.latest_input, prefix_pattern);
+                    let input_parts = request.latest_input.split(".").collect::<Vec<&str>>();
+                    let result_prefix = format!("{}.{}.{}", input_parts[0], input_parts[1], input_parts[2]);
                     repository
                         .parameters()
                         .query_by_path(
@@ -77,15 +85,14 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                             request.test_case_id.clone(),
                             target_action.id,
                             param_type,
-                            remove_prefix(&request.latest_input, "^((.*).(output|input)\\.)"),
+                            suffix.clone(),
                             None,
                         )
                         .await
                         .unwrap()
                         .items
                         .iter()
-                        .map(|p| p.get_path()
-                        )
+                        .map(|p| format!("{}.{}", result_prefix, p.get_path().replace("$.", "")))
                         .collect()
                 }
             }
@@ -242,15 +249,15 @@ fn find_matching_suggestion_strategy(input: &String) -> Option<SuggestionStrateg
     let regexes: Vec<(SuggestionStrategy, Regex)> = vec![
         (
             SuggestionStrategy::ActionNames,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*)").unwrap(),
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*)").unwrap(),
         ),
         (
             SuggestionStrategy::InputOrOutput,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*\.([a-z]*))").unwrap(),
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*\.([a-z]*))").unwrap(),
         ),
         (
             SuggestionStrategy::JsonPath,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9])*\.([a-z]*))\.(.*)").unwrap(),
+            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*\.([a-z]*))\.(.*)").unwrap(),
         ),
     ];
     for (strategy, regex) in regexes {

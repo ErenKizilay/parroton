@@ -6,6 +6,7 @@ use crate::persistence::repo::Repository;
 use axum::http;
 use serde_json::Value;
 use std::sync::Arc;
+use aws_sdk_dynamodb::config::retry::ShouldAttempt::No;
 use uuid::uuid;
 
 async fn handler(parts: http::request::Parts) {}
@@ -151,7 +152,7 @@ fn build_action_execution(run: &Run, action_id: &String, http_req: &HttpRequest,
             .collect(),
         started_at: "".to_string(),
         finished_at: "".to_string(),
-        assertion_results: vec![],
+        assertion_results: None,
     }
 }
 

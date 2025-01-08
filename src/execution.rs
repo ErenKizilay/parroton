@@ -144,7 +144,7 @@ async fn execute(
                 response_body,
                 request_body,
                 query_params: req_params,
-                assertion_results,
+                assertion_results: Some(assertion_results),
             })
             .await;
     });

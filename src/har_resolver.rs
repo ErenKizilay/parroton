@@ -1,5 +1,8 @@
 use crate::models::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
-use crate::models::{Action, Assertion, AssertionItem, AuthHeaderValue, AuthenticationProvider, ComparisonType, Expression, FlattenKeyPrefixType, Parameter, ParameterLocation, ParameterType, TestCase};
+use crate::models::{
+    Action, Assertion, AssertionItem, AuthHeaderValue, AuthenticationProvider, ComparisonType,
+    Expression, FlattenKeyPrefixType, Parameter, ParameterLocation, ParameterType, TestCase,
+};
 use crate::persistence::repo::Repository;
 use har::v1_2::{Entries, Headers, Request};
 use har::Spec;
@@ -16,68 +19,82 @@ pub async fn build_test_case(
     description: &String,
     excluded_path_parts: Vec<String>,
 ) {
+    let entries = filter_entries(excluded_path_parts, spec);
+    let response_indexes: Vec<HashMap<String, Value>> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| build_response_index(i, entry))
+        .collect();
+
+    let request_indexes: Vec<HashMap<String, Value>> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| build_request_index(i, entry))
+        .collect();
+    let case = TestCase {
+        customer_id: customer_id.clone(),
+        id: uuid::Uuid::new_v4().to_string(),
+        name: test_case_name.clone(),
+        description: description.clone(),
+    };
+    let created_test_case = repository.test_cases().create_test_case(case).await;
+
+    let mut actions = vec![];
+    let mut auth_headers_by_base_url: HashMap<String, Vec<HashMap<String, AuthHeaderValue>>> =
+        HashMap::new();
+    for i in 0..entries.len() {
+        let current = entries.get(i).unwrap();
+        println!("{:#?}", current.request.url);
+        let action = build_action(i, &created_test_case, current);
+        let input_parameters = build_action_input(&action, &current.request, &response_indexes);
+        let output_parameters = build_output_parameters(&action, current);
+        let assertions = build_assertions(&action, &request_indexes, &response_indexes);
+        repository.assertions().batch_create(assertions).await;
+        actions.push(action);
+        repository.parameters().batch_create(input_parameters).await;
+        repository
+            .parameters()
+            .batch_create(output_parameters)
+            .await;
+        let auth_headers = build_auth_headers(&current.request);
+        let base_url = obtain_base_url(&current.request.url.as_str());
+        auth_headers_by_base_url
+            .entry(base_url)
+            .or_insert_with(Vec::new)
+            .push(auth_headers);
+    }
+    create_auth_providers(repository, created_test_case, &mut auth_headers_by_base_url).await;
+    repository.actions().batch_create(actions).await;
+}
+
+pub fn filter_entries(excluded_path_parts: Vec<String>, spec: &Spec) -> Vec<&Entries> {
+    println!("{:?}", excluded_path_parts.clone());
+    println!("{:?}", excluded_path_parts.is_empty());
     match spec {
         Spec::V1_2(log_v1) => {
             let entries: Vec<&Entries> = log_v1
                 .entries
                 .iter()
                 .filter(|entry| {
-                    !excluded_path_parts
-                        .iter()
-                        .any(|part| entry.request.url.contains(part))
+                    excluded_path_parts.is_empty()
+                        || !excluded_path_parts
+                            .iter()
+                            .any(|part| entry.request.url.contains(part))
                 })
                 .collect();
-            let response_indexes: Vec<HashMap<String, Value>> = entries
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| build_response_index(i, entry))
-                .collect();
-
-            let request_indexes: Vec<HashMap<String, Value>> = entries
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| build_request_index(i, entry))
-                .collect();
-            let case = TestCase {
-                customer_id: customer_id.clone(),
-                id: uuid::Uuid::new_v4().to_string(),
-                name: test_case_name.clone(),
-                description: description.clone(),
-            };
-            let created_test_case = repository.test_cases().create_test_case(case).await;
-
-            let mut actions = vec![];
-            let mut auth_headers_by_base_url: HashMap<
-                String,
-                Vec<HashMap<String, AuthHeaderValue>>,
-            > = HashMap::new();
-            for i in 0..entries.len() {
-                let current = entries.get(i).unwrap();
-                println!("{:#?}", current.request.url);
-                let action = build_action(i, &created_test_case, current);
-                let input_parameters =
-                    build_action_input(&action, &current.request, &response_indexes);
-                let output_parameters = build_output_parameters(&action, current);
-                let assertions = build_assertions(&action, &request_indexes, &response_indexes);
-                repository.assertions().batch_create(assertions).await;
-                actions.push(action);
-                repository.parameters().batch_create(input_parameters).await;
-                repository.parameters().batch_create(output_parameters).await;
-                let auth_headers = build_auth_headers(&current.request);
-                let base_url = obtain_base_url(&current.request.url.as_str());
-                auth_headers_by_base_url
-                    .entry(base_url)
-                    .or_insert_with(Vec::new)
-                    .push(auth_headers);
-            }
-            create_auth_providers(repository, created_test_case, &mut auth_headers_by_base_url).await;
-            repository.actions().batch_create(actions).await;
+            entries
         }
-        Spec::V1_3(_) => {}
+        Spec::V1_3(log_v2) => {
+            vec![]
+        }
     }
 }
 
-async fn create_auth_providers(repository: &Repository, created_test_case: TestCase, auth_headers_by_base_url: &mut HashMap<String, Vec<HashMap<String, AuthHeaderValue>>>) {
+async fn create_auth_providers(
+    repository: &Repository,
+    created_test_case: TestCase,
+    auth_headers_by_base_url: &mut HashMap<String, Vec<HashMap<String, AuthHeaderValue>>>,
+) {
     let auth_providers = auth_headers_by_base_url
         .iter()
         .map(|(base_url, headers)| {
@@ -98,7 +115,10 @@ async fn create_auth_providers(repository: &Repository, created_test_case: TestC
             }
         })
         .collect::<Vec<AuthenticationProvider>>();
-    repository.auth_providers().batch_create_auth_providers(auth_providers).await;
+    repository
+        .auth_providers()
+        .batch_create_auth_providers(auth_providers)
+        .await;
 }
 
 fn build_action(order: usize, test_case: &TestCase, entry: &Entries) -> Action {
@@ -139,15 +159,25 @@ fn build_response_index(order: usize, entry: &Entries) -> HashMap<String, Value>
     })
 }
 
-pub fn build_response_index_from_value(action_name: &String, response_value: &Value) -> HashMap<String, Value> {
+pub fn build_response_index_from_value(
+    action_name: &String,
+    response_value: &Value,
+) -> HashMap<String, Value> {
     build_index_from_value(action_name, response_value, Output)
 }
 
-pub fn build_request_index_from_value(action_name: &String, input_map: &Value) -> HashMap<String, Value> {
+pub fn build_request_index_from_value(
+    action_name: &String,
+    input_map: &Value,
+) -> HashMap<String, Value> {
     build_index_from_value(action_name, input_map, AssertionExpression)
 }
 
-fn build_index_from_value(action_name: &String, response_value: &Value, flatten_key_prefix_type: FlattenKeyPrefixType) -> HashMap<String, Value> {
+fn build_index_from_value(
+    action_name: &String,
+    response_value: &Value,
+    flatten_key_prefix_type: FlattenKeyPrefixType,
+) -> HashMap<String, Value> {
     let mut result = HashMap::<String, Value>::new();
     flatten_json_value(
         &action_name,
@@ -171,7 +201,10 @@ fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
     parameters
 }
 
-pub fn build_output_parameters_from_value(action: &Action, response_value: &Value) -> Vec<Parameter> {
+pub fn build_output_parameters_from_value(
+    action: &Action,
+    response_value: &Value,
+) -> Vec<Parameter> {
     let mut parameters = vec![];
     let mut result = HashMap::<String, Value>::new();
     flatten_json_value(
@@ -244,31 +277,34 @@ pub fn build_assertions(
 ) -> Vec<Assertion> {
     let mut assertions: Vec<Assertion> = vec![];
 
-    response_indexes.get(action.order).iter().for_each(|response| {
-        response.iter().for_each(|(path, res_value)| {
-            if should_build_assertion_for_response_value(res_value) {
-                let mut slice = request_indexes[0..action.order].to_vec();
-                slice.reverse();
-                let expression_result =
-                    resolve_value_expression_from_slice_index(&res_value, &slice);
-                if let Some(expression) = expression_result {
-                    let assertion = Assertion {
-                        customer_id: action.customer_id.clone(),
-                        test_case_id: action.test_case_id.clone(),
-                        action_id: action.id.clone(),
-                        id: Uuid::new_v4().to_string(),
-                        left: AssertionItem::from_expression(expression),
-                        right: AssertionItem::from_expression(Expression {
-                            value: path.to_string(),
-                        }),
-                        comparison_type: ComparisonType::EqualTo,
-                        negate: false,
-                    };
-                    assertions.push(assertion);
+    response_indexes
+        .get(action.order)
+        .iter()
+        .for_each(|response| {
+            response.iter().for_each(|(path, res_value)| {
+                if should_build_assertion_for_response_value(res_value) {
+                    let mut slice = request_indexes[0..action.order].to_vec();
+                    slice.reverse();
+                    let expression_result =
+                        resolve_value_expression_from_slice_index(&res_value, &slice);
+                    if let Some(expression) = expression_result {
+                        let assertion = Assertion {
+                            customer_id: action.customer_id.clone(),
+                            test_case_id: action.test_case_id.clone(),
+                            action_id: action.id.clone(),
+                            id: Uuid::new_v4().to_string(),
+                            left: AssertionItem::from_expression(expression),
+                            right: AssertionItem::from_expression(Expression {
+                                value: path.to_string(),
+                            }),
+                            comparison_type: ComparisonType::EqualTo,
+                            negate: false,
+                        };
+                        assertions.push(assertion);
+                    }
                 }
-            }
-        })
-    });
+            })
+        });
     assertions
 }
 
@@ -288,7 +324,11 @@ fn build_body_parameters(
     request.post_data.as_ref().inspect(|post_data| {
         if let Some(content) = &post_data.text {
             if let Ok(value) = serde_json::from_str::<Value>(content) {
-                parameters.extend(build_body_parameters_from_value(&action, response_indexes, &value));
+                parameters.extend(build_body_parameters_from_value(
+                    &action,
+                    response_indexes,
+                    &value,
+                ));
             }
         }
         if let Some(params) = &post_data.params {
@@ -315,7 +355,11 @@ fn build_body_parameters(
     parameters
 }
 
-pub fn build_body_parameters_from_value(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, value: &Value) -> Vec<Parameter> {
+pub fn build_body_parameters_from_value(
+    action: &Action,
+    response_indexes: &Vec<HashMap<String, Value>>,
+    value: &Value,
+) -> Vec<Parameter> {
     let mut parameters: Vec<Parameter> = vec![];
     let mut flatten_result: HashMap<String, Value> = HashMap::new();
     flatten_json_value(
@@ -355,7 +399,12 @@ fn build_query_parameters(
     parameters
 }
 
-pub fn build_query_param(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, query_string_value: &String, query_key: &String) -> Parameter {
+pub fn build_query_param(
+    action: &Action,
+    response_indexes: &Vec<HashMap<String, Value>>,
+    query_string_value: &String,
+    query_key: &String,
+) -> Parameter {
     let expression = resolve_value_expression_from_prev(
         action.order,
         &Value::String(query_string_value.clone()),
@@ -396,18 +445,25 @@ fn build_header_parameters(
     response_indexes: &Vec<HashMap<String, Value>>,
 ) -> Vec<Parameter> {
     let mut parameters: Vec<Parameter> = vec![];
-    request
-        .headers
-        .iter()
-        .for_each(|header| {
-            if let Some(parameter) = build_header_parameter(action, response_indexes, &resolve_header_name(header), &header.value) {
-                parameters.push(parameter);
-            }
-        });
+    request.headers.iter().for_each(|header| {
+        if let Some(parameter) = build_header_parameter(
+            action,
+            response_indexes,
+            &resolve_header_name(header),
+            &header.value,
+        ) {
+            parameters.push(parameter);
+        }
+    });
     parameters
 }
 
-fn build_header_parameter(action: &Action, response_indexes: &Vec<HashMap<String, Value>>, header_name: &String, header_val: &String) -> Option<Parameter> {
+fn build_header_parameter(
+    action: &Action,
+    response_indexes: &Vec<HashMap<String, Value>>,
+    header_name: &String,
+    header_val: &String,
+) -> Option<Parameter> {
     if is_auth_related_header(&header_name) {
         None
     } else {
@@ -542,8 +598,8 @@ fn is_auth_related_header(key: &String) -> bool {
         "cookie",
         "auth",
     ]
-        .iter()
-        .any(|x| key.contains(x))
+    .iter()
+    .any(|x| key.contains(x))
 }
 
 fn obtain_base_url(url: &str) -> String {

@@ -1,17 +1,17 @@
 use crate::api::{ApiResponse, AppError, AppState};
 use crate::execution::{run_test, RunTestCaseCommand};
-use crate::har_resolver::build_test_case;
+use crate::har_resolver::{build_test_case, filter_entries};
 use crate::json_path_utils;
 use crate::json_path_utils::AutoCompleteRequest;
-use crate::models::{Action, ActionExecution, Assertion, AssertionItem, AuthenticationProvider, ComparisonType, Expression, Parameter, ParameterType, Run, TestCase};
+use crate::models::{Action, ActionExecutionPair, Assertion, AssertionItem, AuthenticationProvider, ComparisonType, Expression, Parameter, ParameterType, Run, TestCase};
 use crate::persistence::repo::{ParameterIn, QueryResult, Repository};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use har::Har;
+use har::{Error, Har};
 use serde::Deserialize;
-use std::io::Cursor;
+use std::io::{Cursor, ErrorKind};
 
 pub async fn list_test_cases(State(repository): State<Repository>) -> Result<ApiResponse<QueryResult<TestCase>>, AppError> {
     let result = repository.test_cases().list("eren".to_string(), None).await;
@@ -75,10 +75,10 @@ pub async fn get_run(
 pub async fn get_action_executions(
     Path(path_params): Path<(String, String)>,
     State(app_state): State<AppState>,
-) -> Result<ApiResponse<Vec<ActionExecution>>, AppError> {
+) -> Result<ApiResponse<Vec<ActionExecutionPair>>, AppError> {
     let result = app_state
         .repository.action_executions()
-        .list(&"eren".to_string(), &path_params.0, &path_params.1)
+        .list_with_actions(&"eren".to_string(), &path_params.0, &path_params.1)
         .await;
     ApiResponse::from(result)
 }
@@ -233,11 +233,55 @@ pub async fn upload_test_case(
     }
 }
 
+pub async fn filter_paths(
+    mut multipart: Multipart,
+) -> Result<ApiResponse<Vec<String>>, AppError> {
+    let mut provided_har: Result<Har, Error> = Err(Error::Io(std::io::Error::new(ErrorKind::Other, "No Har found")));
+    let mut provided_excluded_path_parts: Vec<String> = vec![];
+    while let Some(mut field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_string();
+        match name.as_str() {
+            "excluded_paths" => {
+                provided_excluded_path_parts = field
+                    .text()
+                    .await
+                    .unwrap()
+                    .split(",")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "file" => {
+                let data = field.bytes().await.unwrap();
+                provided_har = har::from_reader(Cursor::new(data))
+            }
+            _ => {}
+        }
+    }
+
+    match provided_har {
+        Ok(har) => {
+            let urls: Vec<String> = filter_entries(provided_excluded_path_parts, &har.log)
+                .iter()
+                .map(|entry| { &entry.request.url })
+                .cloned()
+                .collect();
+            ApiResponse::from(Ok(urls))
+        }
+        Err(err) => {
+            Err(AppError::Processing(err.to_string()))
+        }
+    }
+}
+
 pub async fn upload(mut multipart: Multipart) {
     while let Some(mut field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
         let data = field.bytes().await.unwrap();
         println!("Length of `{}` is {} bytes", name, data.len());
+        if name.eq("file") {
+            println!("File: {}", String::from_utf8_lossy(&data));
+        }
     }
 }
 
