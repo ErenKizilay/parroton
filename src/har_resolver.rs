@@ -1,8 +1,3 @@
-use crate::models::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
-use crate::models::{
-    Action, Assertion, AssertionItem, AuthHeaderValue, AuthenticationProvider, ComparisonType,
-    Expression, FlattenKeyPrefixType, Parameter, ParameterLocation, ParameterType, TestCase,
-};
 use crate::persistence::repo::Repository;
 use har::v1_2::{Entries, Headers, Request};
 use har::Spec;
@@ -10,6 +5,13 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
+use crate::action::model::Action;
+use crate::assertion::model::{Assertion, AssertionItem, ComparisonType};
+use crate::auth::model::{AuthHeaderValue, AuthenticationProvider};
+use crate::case::model::TestCase;
+use crate::har_resolver::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
+use crate::json_path::model::Expression;
+use crate::parameter::model::{Parameter, ParameterLocation, ParameterType};
 
 pub async fn build_test_case(
     repository: &Repository,
@@ -18,6 +20,7 @@ pub async fn build_test_case(
     test_case_name: &String,
     description: &String,
     excluded_path_parts: Vec<String>,
+    auth_providers: Vec<String>,
 ) {
     let entries = filter_entries(excluded_path_parts, spec);
     let response_indexes: Vec<HashMap<String, Value>> = entries
@@ -33,13 +36,21 @@ pub async fn build_test_case(
         .collect();
     let case = TestCase {
         customer_id: customer_id.clone(),
-        id: uuid::Uuid::new_v4().to_string(),
+        id: Uuid::new_v4().to_string(),
         name: test_case_name.clone(),
         description: description.clone(),
     };
     let created_test_case = repository.test_cases().create_test_case(case).await;
 
     let mut actions = vec![];
+    let existing_auth_providers = if auth_providers.is_empty() {
+        vec![]
+    } else {
+        repository.auth_providers()
+            .batch_get(customer_id, auth_providers)
+            .await
+            .unwrap_or(vec![])
+    };
     let mut auth_headers_by_base_url: HashMap<String, Vec<HashMap<String, AuthHeaderValue>>> =
         HashMap::new();
     for i in 0..entries.len() {
@@ -56,14 +67,25 @@ pub async fn build_test_case(
             .parameters()
             .batch_create(output_parameters)
             .await;
-        let auth_headers = build_auth_headers(&current.request);
         let base_url = obtain_base_url(&current.request.url.as_str());
-        auth_headers_by_base_url
-            .entry(base_url)
-            .or_insert_with(Vec::new)
-            .push(auth_headers);
+        let matched_provider = existing_auth_providers.iter()
+            .find(|auth_provider| { auth_provider.base_url.eq(&base_url) });
+
+        match matched_provider {
+            None => {
+                let auth_headers = build_auth_headers(&current.request);
+                auth_headers_by_base_url
+                    .entry(base_url)
+                    .or_insert_with(Vec::new)
+                    .push(auth_headers);
+            }
+            Some(auth_provider) => {
+                repository.auth_providers()
+                    .link(customer_id, &auth_provider.id, &created_test_case.id).await;
+            }
+        }
     }
-    create_auth_providers(repository, created_test_case, &mut auth_headers_by_base_url).await;
+    create_auth_providers(repository, created_test_case.clone(), &mut auth_headers_by_base_url).await;
     repository.actions().batch_create(actions).await;
 }
 
@@ -201,6 +223,12 @@ fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
     parameters
 }
 
+pub enum FlattenKeyPrefixType {
+    Output,
+    Input,
+    AssertionExpression,
+}
+
 pub fn build_output_parameters_from_value(
     action: &Action,
     response_value: &Value,
@@ -291,7 +319,6 @@ pub fn build_assertions(
                         let assertion = Assertion {
                             customer_id: action.customer_id.clone(),
                             test_case_id: action.test_case_id.clone(),
-                            action_id: action.id.clone(),
                             id: Uuid::new_v4().to_string(),
                             left: AssertionItem::from_expression(expression),
                             right: AssertionItem::from_expression(Expression {

@@ -1,21 +1,11 @@
-use crate::models::{Expression, Parameter, ParameterType};
+use crate::parameter::model::{Parameter, ParameterType};
 use crate::persistence::repo::Repository;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use serde_json_path::JsonPath;
-use tracing::info;
-use tracing_subscriber::fmt::format;
-
-#[derive(Deserialize)]
-pub struct AutoCompleteRequest {
-    customer_id: String,
-    test_case_id: String,
-    source_action_id: String,
-    source_action_name: String,
-    source_action_order: usize,
-    latest_input: String,
-}
+use crate::json_path::api::AutoCompleteRequest;
+use crate::json_path::model::Expression;
 
 #[derive(Debug, PartialEq)]
 enum SuggestionStrategy {
@@ -25,7 +15,7 @@ enum SuggestionStrategy {
 }
 
 pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest) -> Vec<String> {
-    let strategy_option = find_matching_suggestion_strategy(&request.latest_input);
+    let strategy_option = crate::json_path::utils::find_matching_suggestion_strategy(&request.latest_input);
     println!("input: {:?}, stg: {:?}", request.latest_input, strategy_option);
     match strategy_option {
         None => {
@@ -33,12 +23,12 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
         }
         Some(strategy) => {
             match strategy {
-                SuggestionStrategy::ActionNames => repository
+                crate::json_path::utils::SuggestionStrategy::ActionNames => repository
                     .actions()
                     .list_previous(
                         request.customer_id.clone(),
                         request.test_case_id.clone(),
-                        request.source_action_order,
+                        request.source_action_order.unwrap_or(1000),
                         None,
                     )
                     .await
@@ -47,24 +37,23 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                     .iter()
                     .map(|a| format!("$.{}", a.name))
                     .collect(),
-                SuggestionStrategy::InputOrOutput => {
+                crate::json_path::utils::SuggestionStrategy::InputOrOutput => {
                     let input_parts = request.latest_input.split(".").collect::<Vec<&str>>();
                     vec![format!("{}.{}.{}", input_parts[0], input_parts[1], "input".to_string()),
                          format!("{}.{}.{}", input_parts[0], input_parts[1], "output".to_string())]
                 }
-                SuggestionStrategy::JsonPath => {
+                crate::json_path::utils::SuggestionStrategy::JsonPath => {
                     let param_type = if request.latest_input.contains("output.") {
                         ParameterType::Output
                     } else {
                         ParameterType::Input
                     };
 
-                    let target_action_name = substring_between(
+                    let target_action_name = crate::json_path::utils::substring_between(
                         request.latest_input.clone(),
                         "$.".to_string(),
                         ".".to_string(),
                     );
-                    info!("target_action_name: {}", target_action_name);
                     let target_action = repository
                         .actions()
                         .get_action_by_name(
@@ -74,8 +63,7 @@ pub async fn auto_complete(repository: &Repository, request: AutoCompleteRequest
                         )
                         .await
                         .unwrap();
-                    let prefix_pattern = "^((.*).(output|input)\\.)";
-                    let suffix = remove_prefix(&request.latest_input, prefix_pattern);
+                    let suffix = crate::json_path::utils::remove_prefix(&request.latest_input);
                     let input_parts = request.latest_input.split(".").collect::<Vec<&str>>();
                     let result_prefix = format!("{}.{}.{}", input_parts[0], input_parts[1], input_parts[2]);
                     repository
@@ -226,17 +214,14 @@ pub fn reverse_flatten_all(path_value_pairs: Vec<(String, Value)>) -> Value {
     Value::Object(root)
 }
 
-fn remove_prefix(s: &String, pattern: &str) -> String {
+fn remove_prefix(s: &String) -> String {
     let regex = Regex::new("^((.*).(output|input)\\.)").unwrap();
-    info!("s: [{}] p: {}", s, pattern);
     format!(
         "$.{}",
         regex
             .captures(s.as_str())
             .iter()
             .map(|caps| {
-                info!("caps: {:?}", caps);
-                info!("cap 1: {:?}", caps.get(1).unwrap().as_str());
                 s.strip_prefix(caps.get(1).unwrap().as_str().trim_matches('"'))
                     .unwrap_or(s.as_str())
             })
@@ -246,27 +231,13 @@ fn remove_prefix(s: &String, pattern: &str) -> String {
 }
 
 fn find_matching_suggestion_strategy(input: &String) -> Option<SuggestionStrategy> {
-    let regexes: Vec<(SuggestionStrategy, Regex)> = vec![
-        (
-            SuggestionStrategy::ActionNames,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*)").unwrap(),
-        ),
-        (
-            SuggestionStrategy::InputOrOutput,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*\.([a-z]*))").unwrap(),
-        ),
-        (
-            SuggestionStrategy::JsonPath,
-            Regex::new(r"(\$\.([a-z]|[A-Z]|[0-9]|(_))*\.([a-z]*))\.(.*)").unwrap(),
-        ),
-    ];
-    for (strategy, regex) in regexes {
-        let replace_result = regex.replace_all(input.as_str(), "");
-        if replace_result.len() == 0 {
-            return Some(strategy);
-        }
+    let dot_count = input.chars().filter(|c| *c == '.').count();
+    match dot_count {
+        0 => None,
+        1 => Some(SuggestionStrategy::ActionNames),
+        2 => Some(SuggestionStrategy::InputOrOutput),
+        _ => Some(SuggestionStrategy::JsonPath),
     }
-    None
 }
 
 #[cfg(test)]

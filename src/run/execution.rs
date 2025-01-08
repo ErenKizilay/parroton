@@ -1,11 +1,13 @@
+use crate::action::model::Action;
+use crate::action_execution::model::ActionExecution;
 use crate::api::AppError;
-use crate::assertions::check_assertion;
+use crate::assertion::model::AssertionResult;
 use crate::http::{
     ApiClient, Endpoint, HttpError, HttpMethod, HttpRequest, HttpResult, ReqBody, ReqParam,
 };
-use crate::json_path_utils::{evaluate_value, reverse_flatten_all};
-use crate::models::{Action, ActionExecution, AssertionResult, Parameter, Run, RunStatus};
-use crate::persistence::repo::{ParameterIn, Repository};
+use crate::parameter::model::{Parameter, ParameterIn};
+use crate::persistence::repo::Repository;
+use crate::run::model::{Run, RunStatus};
 use aws_sdk_dynamodb::primitives::DateTime;
 use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
 use serde_json::{Map, Value};
@@ -14,6 +16,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::info;
 use uuid::Uuid;
+use crate::assertion::check::check_assertion;
+use crate::json_path::utils::{evaluate_value, reverse_flatten_all};
 
 pub struct RunTestCaseCommand {
     pub customer_id: String,
@@ -46,6 +50,7 @@ pub async fn run_test(
                             status: RunStatus::InProgress,
                             started_at: DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap(),
                             finished_at: None,
+                            assertion_results: None,
                         })
                         .await;
                     let cloned_run = run.clone();
@@ -68,12 +73,20 @@ pub async fn run_test(
                                 &mut context)
                                 .await;
                         }
+                        let assertions = repo_cloned.assertions()
+                            .list(&cloned_run.customer_id, &cloned_run.test_case_id).await
+                            .unwrap().items;
+                        let assertion_context = Value::Object(context.clone());
+                        let assertion_results: Vec<AssertionResult> = assertions.iter()
+                            .map(|assertion| { check_assertion(assertion, &assertion_context) })
+                            .collect();
                         repo_cloned.runs()
                             .update(
                                 &cloned_run.customer_id,
                                 &cloned_run.test_case_id,
                                 &cloned_run.id,
                                 &RunStatus::Finished,
+                                assertion_results,
                             )
                             .await;
                     });
@@ -121,14 +134,8 @@ async fn execute(
     let status_code = resolve_status_code(&result);
     let error = resolve_error_from_result(&result);
     let response_body = resolve_response_from_result(&result);
-    let assertion_context = Value::Object(context.clone());
+    let request_body_cloned = request_body.clone();
     tokio::spawn(async move {
-        let assertions = arc_repo_clone.assertions()
-            .list(&run_cloned.customer_id.clone(), &run_cloned.test_case_id.clone()).await
-            .unwrap().items;
-        let assertion_results: Vec<AssertionResult> = assertions.iter()
-            .map(|assertion| { check_assertion(assertion, &assertion_context) })
-            .collect();
         arc_repo_clone
             .action_executions()
             .create(ActionExecution {
@@ -142,9 +149,8 @@ async fn execute(
                 started_at: DateTime::from(started_at).fmt(DateTimeWithOffset).unwrap(),
                 finished_at: DateTime::from(finished_at).fmt(DateTimeWithOffset).unwrap(),
                 response_body,
-                request_body,
+                request_body: request_body_cloned,
                 query_params: req_params,
-                assertion_results: Some(assertion_results),
             })
             .await;
     });
@@ -154,6 +160,7 @@ async fn execute(
     };
     let mut temp = Map::new();
     temp.insert("output".to_string(), action_context);
+    temp.insert("input".to_string(), request_body.unwrap_or(Value::Null));
     context.insert(action.name.clone(), Value::Object(temp));
 }
 
@@ -329,8 +336,10 @@ fn obtain_base_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Expression, ParameterLocation, ParameterType};
+    use crate::parameter::model::{ParameterLocation, ParameterType};
     use serde_json::json;
+    use crate::json_path::model::Expression;
+
     #[test]
     fn test_build_request_body() {
         let param_with_expression = Parameter {

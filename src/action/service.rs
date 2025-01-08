@@ -1,9 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
+use crate::action::model::Action;
 use crate::api::AppError;
-use crate::models::Action;
 use crate::persistence::repo::{build_composite_key, OnDeleteMessage, PageKey, QueryResult, Table};
 
 pub struct ActionOperations {
@@ -35,6 +36,8 @@ impl Table<Action> for ActionsTable {
         Self::sort_key(build_composite_key(vec![entity.id.clone()]))
     }
 
+
+
     fn add_index_key_attributes(entity: &Action, item: &mut HashMap<String, AttributeValue>) {
         item.insert(
             "name".to_string(),
@@ -44,6 +47,10 @@ impl Table<Action> for ActionsTable {
 
     fn build_deleted_event(entity: Action) -> Option<OnDeleteMessage> {
         Some(OnDeleteMessage::ActionDeleted(entity))
+    }
+
+    fn ordering(e1: &Action, e2: &Action) -> Ordering {
+        e1.order.cmp(&e2.order)
     }
 }
 
@@ -113,7 +120,7 @@ impl ActionOperations {
             .expression_attribute_names("#sk", "name")
             .expression_attribute_values(":pk", partition_key.1)
             .expression_attribute_values(":sk", AttributeValue::S(name.to_string()))
-            .key_condition_expression("#pk = :pk AND #sk < :sk")
+            .key_condition_expression("#pk = :pk AND #sk = :sk")
             .send()
             .await;
 

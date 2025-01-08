@@ -1,17 +1,18 @@
+use std::cmp::Ordering;
 use crate::api::AppError;
-use crate::models::{ActionExecution, ActionExecutionPair};
-use crate::persistence::actions::ActionsTable;
 use crate::persistence::repo::{build_composite_key, Table};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
+use crate::action::service::ActionsTable;
+use crate::action_execution::model::{ActionExecution, ActionExecutionPair};
 
 pub struct ActionExecutionsOperations {
     pub(crate) client: Arc<Client>,
 }
-struct ActionExecutionTable();
+pub(crate) struct ActionExecutionTable();
 
 impl Table<ActionExecution> for ActionExecutionTable {
     fn table_name() -> String {
@@ -25,6 +26,8 @@ impl Table<ActionExecution> for ActionExecutionTable {
     fn sort_key_name() -> String {
         "id".to_string()
     }
+
+
 
     fn partition_key_from_entity(entity: &ActionExecution) -> (String, AttributeValue) {
         Self::partition_key(build_composite_key(vec![
@@ -46,6 +49,12 @@ impl Table<ActionExecution> for ActionExecutionTable {
             "started_at".to_string(),
             AttributeValue::S(entity.started_at.to_string()),
         );
+    }
+
+    fn ordering(e1: &ActionExecution, e2: &ActionExecution) -> Ordering {
+        let started_at1 = DateTime::from_str(e1.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
+        let started_at2 = DateTime::from_str(e2.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
+        started_at1.cmp(&started_at2)
     }
 }
 
@@ -90,12 +99,6 @@ impl ActionExecutionsOperations {
                                 execution: exec,
                             })
                             .collect();
-
-                        pairs.sort_by(|a, b| {
-                            let start_time = DateTime::from_str(a.execution.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
-                            let end_time = DateTime::from_str(b.execution.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
-                            start_time.cmp(&end_time)
-                        });
                         pairs
                     })
             }
