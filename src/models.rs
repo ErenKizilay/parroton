@@ -87,9 +87,15 @@ pub struct ActionExecution {
     pub query_params: Vec<(String, String)>,
     pub started_at: String,
     pub finished_at: String,
-    pub assertion_results: Vec<AssertionResult>,
-
+    pub assertion_results: Option<Vec<AssertionResult>>,
 }
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ActionExecutionPair {
+    pub action: Option<Action>,
+    pub execution: ActionExecution,
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProxyRecord {

@@ -1,10 +1,12 @@
 use crate::api::AppError;
-use crate::models::ActionExecution;
+use crate::models::{ActionExecution, ActionExecutionPair};
+use crate::persistence::actions::ActionsTable;
 use crate::persistence::repo::{build_composite_key, Table};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
 
 pub struct ActionExecutionsOperations {
     pub(crate) client: Arc<Client>,
@@ -48,6 +50,59 @@ impl Table<ActionExecution> for ActionExecutionTable {
 }
 
 impl ActionExecutionsOperations {
+
+    pub async fn list_with_actions(
+        &self,
+        customer_id: &String,
+        test_case_id: &String,
+        run_id: &String,
+    ) -> Result<Vec<ActionExecutionPair>, AppError> {
+        let result = ActionExecutionTable::list_all_items(
+            self.client.clone(),
+            build_composite_key(vec![
+                customer_id.clone(),
+                test_case_id.clone(),
+                run_id.clone(),
+            ]),
+        )
+            .await;
+        match result {
+            Ok(execs) => {
+                let key_pairs = execs
+                    .iter()
+                    .map(|exec| {
+                        (
+                            build_composite_key(vec![
+                                exec.customer_id.clone(),
+                                exec.test_case_id.clone(),
+                            ]),
+                            exec.action_id.clone(),
+                        )
+                    })
+                    .collect();
+                ActionsTable::batch_get_items(self.client.clone(), key_pairs)
+                    .await
+                    .map(|actions| {
+                        let mut pairs: Vec<ActionExecutionPair> = execs
+                            .into_iter()
+                            .map(|exec| ActionExecutionPair {
+                                action: (actions.iter().find(|a| a.id.eq(&exec.action_id))).cloned(),
+                                execution: exec,
+                            })
+                            .collect();
+
+                        pairs.sort_by(|a, b| {
+                            let start_time = DateTime::from_str(a.execution.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
+                            let end_time = DateTime::from_str(b.execution.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
+                            start_time.cmp(&end_time)
+                        });
+                        pairs
+                    })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn list(
         &self,
         customer_id: &String,
@@ -64,10 +119,7 @@ impl ActionExecutionsOperations {
         ).await
     }
 
-    pub async fn create(
-        &self,
-        action_execution: ActionExecution,
-    ) -> ActionExecution {
+    pub async fn create(&self, action_execution: ActionExecution) -> ActionExecution {
         ActionExecutionTable::put_item(self.client.clone(), action_execution)
             .await
             .unwrap()

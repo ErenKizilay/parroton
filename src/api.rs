@@ -1,6 +1,6 @@
 use crate::http::ApiClient;
 use crate::persistence::repo::Repository;
-use crate::routes::{auto_complete, delete_test_case, get_action_executions, get_run, get_test_case, list_actions, list_assertions, list_auth_providers, list_parameters, list_runs, list_test_cases, run_test_case, update_parameter_expression, upload, upload_test_case};
+use crate::routes::{auto_complete, delete_test_case, filter_paths, get_action_executions, get_run, get_test_case, list_actions, list_assertions, list_auth_providers, list_parameters, list_runs, list_test_cases, run_test_case, update_parameter_expression, upload, upload_test_case};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::StatusCode;
@@ -57,6 +57,7 @@ pub async fn build_api() -> Router {
         .route("/auth-providers", get(list_auth_providers))
         .route("/auto-complete", post(auto_complete))
         .route("/upload", post(upload))
+        .route("/filter-paths", post(filter_paths))
         .layer(cors)
         .layer(DefaultBodyLimit::max(5003944))
         .layer(TraceLayer::new_for_http()
