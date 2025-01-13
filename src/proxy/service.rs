@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use crate::har_resolver::{build_action_name_from_url, build_assertions, build_body_parameters_from_value, build_output_parameters_from_value, build_query_param, build_request_index_from_value, build_response_index_from_value};
 use crate::http::{ApiClient, HttpRequest, HttpResult};
-use crate::models::{Action, ActionExecution, Assertion, Parameter, ProxyRecord, Run, RunStatus, TestCase};
 use crate::persistence::repo::Repository;
 use axum::http;
 use serde_json::Value;
 use std::sync::Arc;
 use aws_sdk_dynamodb::config::retry::ShouldAttempt::No;
 use uuid::uuid;
+use crate::action::model::Action;
+use crate::action_execution::model::ActionExecution;
+use crate::assertion::model::Assertion;
+use crate::case::model::TestCase;
+use crate::parameter::model::Parameter;
+use crate::proxy::model::ProxyRecord;
+use crate::run::model::{Run, RunStatus};
 
 async fn handler(parts: http::request::Parts) {}
 
@@ -31,6 +37,7 @@ async fn start_record(repository: Arc<Repository>, request: CreateProxyRecordReq
         status: RunStatus::InProgress,
         started_at: "".to_string(),
         finished_at: None,
+        assertion_results: None,
     };
     let repo_clone = repository.clone();
     let repo_clone2 = repository.clone();
@@ -60,9 +67,9 @@ async fn end_record(repository: Arc<Repository>, action: &Action, run: &Run) {
     let repo_cloned = repository.clone();
     let repo_cloned2 = repository.clone();
     tokio::task::spawn(async move {
-       repo_cloned.parameters()
-           .batch_create(action_param_result.parameters)
-           .await;
+        repo_cloned.parameters()
+            .batch_create(action_param_result.parameters)
+            .await;
     });
 
     tokio::task::spawn(async move {
@@ -91,7 +98,7 @@ fn build_action_parameters(action: &Action, executions: Vec<ActionExecution>) ->
     let indexes: (Vec<HashMap<String, Value>>, Vec<HashMap<String, Value>>) = executions.iter()
         .map(|execution| {
             (build_request_index_from_value(&action.name, &execution.clone().request_body.unwrap_or(Value::Null)),
-            build_response_index_from_value(&action.name, &execution.clone().response_body.unwrap_or(Value::Null)))
+             build_response_index_from_value(&action.name, &execution.clone().response_body.unwrap_or(Value::Null)))
         }).collect();
 
     let mut parameters: Vec<Parameter> = Vec::new();
@@ -152,7 +159,6 @@ fn build_action_execution(run: &Run, action_id: &String, http_req: &HttpRequest,
             .collect(),
         started_at: "".to_string(),
         finished_at: "".to_string(),
-        assertion_results: None,
     }
 }
 

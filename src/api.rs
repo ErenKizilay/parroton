@@ -1,11 +1,13 @@
+use crate::assertion::api::{delete_assertion, get_assertion, list_assertions, put_assertion, update_assertion_comparison, update_assertion_negation};
+use crate::auth::api::{delete_auth_provider, list_auth_providers, set_auth_header_enablement, set_auth_header_value};
 use crate::http::ApiClient;
 use crate::persistence::repo::Repository;
-use crate::routes::{auto_complete, delete_test_case, filter_paths, get_action_executions, get_run, get_test_case, list_actions, list_assertions, list_auth_providers, list_parameters, list_runs, list_test_cases, run_test_case, update_parameter_expression, upload, upload_test_case};
+use crate::run::api::{get_run, list_runs, run_test_case};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -14,6 +16,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tracing::Level;
+use crate::action::api::list_actions;
+use crate::action_execution::api::get_action_executions;
+use crate::case::api::{delete_test_case, filter_paths, get_test_case, list_test_cases, upload_test_case};
+use crate::json_path::api::auto_complete;
+use crate::parameter::api::{list_parameters, update_parameter_expression};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,12 +58,17 @@ pub async fn build_api() -> Router {
         .route("/test-cases/:id/runs/:run_id", get(get_run))
         .route("/test-cases/:id/run", post(run_test_case))
         .route("/test-cases/:id/runs", get(list_runs))
-        .route("/test-cases/:id/assertions", get(list_assertions))
+        .route("/test-cases/:test_case_id/assertions/:id/comparison-type", patch(update_assertion_comparison))
+        .route("/test-cases/:test_case_id/assertions/:id/negate", patch(update_assertion_negation))
+        .route("/test-cases/:test_case_id/assertions/:id", get(get_assertion).delete(delete_assertion))
+        .route("/test-cases/:id/assertions", get(list_assertions).put(put_assertion))
         .route("/test-cases/:id", get(get_test_case).delete(delete_test_case))
+        .route("/auth-providers/:id", delete(delete_auth_provider))
+        .route("/auth-providers/:id/value", patch(set_auth_header_value))
+        .route("/auth-providers/:id/disabled", patch(set_auth_header_enablement))
         .route("/test-cases", get(list_test_cases).post(upload_test_case))
         .route("/auth-providers", get(list_auth_providers))
         .route("/auto-complete", post(auto_complete))
-        .route("/upload", post(upload))
         .route("/filter-paths", post(filter_paths))
         .layer(cors)
         .layer(DefaultBodyLimit::max(5003944))

@@ -1,6 +1,7 @@
-use crate::json_path_utils::evaluate_expression;
-use crate::models::{Assertion, AssertionItem, AssertionResult, ComparisonType, Function, Operation, ValueProvider};
+
 use serde_json::Value;
+use crate::assertion::model::{Assertion, AssertionItem, AssertionResult, ComparisonType, Function, Operation, ValueProvider};
+use crate::json_path::utils::evaluate_expression;
 
 trait ValueSupplier {
     fn supply(&self, context: &Value) -> Result<Vec<Value>, String>;
@@ -106,13 +107,13 @@ pub fn check_assertion(assertion: &Assertion, context: &Value) -> AssertionResul
             let right_result = assertion.right.supply(context);
             match right_result {
                 Ok(right_val) => {
-                    check(&assertion.comparison_type, assertion.negate, left_val, right_val)
+                    check(&assertion, left_val, right_val)
                 }
-                Err(err) => { AssertionResult::from_error(err) }
+                Err(err) => { AssertionResult::from_error(assertion.id.to_string() ,err) }
             }
         }
         Err(err) => {
-            AssertionResult::from_error(err)
+            AssertionResult::from_error(assertion.id.to_string(), err)
         }
     }
 }
@@ -124,54 +125,54 @@ fn as_string(val: Vec<Value>) -> String {
         .unwrap_or("".to_string())
 }
 
-fn check(comparison_type: &ComparisonType, negate: bool, left: Vec<Value>, right: Vec<Value>) -> AssertionResult {
-    match comparison_type {
+fn check(assertion: &Assertion, left: Vec<Value>, right: Vec<Value>) -> AssertionResult {
+    match assertion.comparison_type {
         ComparisonType::EqualTo => {
             let equals = left.eq(&right);
-            if equals ^ negate {
-                AssertionResult::of_success()
+            if equals ^ assertion.negate {
+                AssertionResult::of_success(assertion.id.to_string())
             } else {
-                AssertionResult::from_error(format!("{}expected: {:?}, but got: {:?}",
-                                                    if negate { "not " } else { "" },
-                                                    as_string(left), as_string(right)))
+                AssertionResult::from_error(assertion.id.to_string(), format!("{}expected: {:?}, but got: {:?}",
+                                                                              if assertion.negate { "not " } else { "" },
+                                                                              as_string(left), as_string(right)))
             }
         }
         ComparisonType::Contains => {
             let all_contained = right.iter().all(|v| { left.contains(&v) });
             if all_contained {
-                AssertionResult::of_success()
+                AssertionResult::of_success(assertion.id.to_string())
             } else {
                 if left.len() == right.len() && left.len() == 1 {
                     let left_item = left.get(0).unwrap();
                     let right_item = right.get(0).unwrap();
                     let contains = left_item.to_string().contains(right_item.to_string().trim_matches('"'));
-                    if contains ^ negate {
-                        AssertionResult::of_success()
+                    if contains ^ assertion.negate {
+                        AssertionResult::of_success(assertion.id.to_string())
                     } else {
-                        AssertionResult::from_error(format!("{} does{} contain {}",
-                                                            as_string(left), if negate { "" } else { " not" }, as_string(right), ))
+                        AssertionResult::from_error(assertion.id.to_string(), format!("{} does{} contain {}",
+                                                                                      as_string(left), if assertion.negate { "" } else { " not" }, as_string(right), ))
                     }
                 } else {
-                    AssertionResult::from_error(format!("{} and {} cannot be compared with contains", as_string(left), as_string(right)))
+                    AssertionResult::from_error(assertion.id.to_string(), format!("{} and {} cannot be compared with contains", as_string(left), as_string(right)))
                 }
             }
         }
         ComparisonType::GreaterThan => {
-            check_greater_than(negate, true, false, left, right)
+            check_greater_than(assertion, true, false, left, right)
         }
         ComparisonType::GreaterThanOrEqualTo => {
-            check_greater_than(negate, true, true, left, right)
+            check_greater_than(assertion, true, true, left, right)
         }
         ComparisonType::LessThan => {
-            check_greater_than(negate, false, false, left, right)
+            check_greater_than(assertion, false, false, left, right)
         }
         ComparisonType::LessThanOrEqualTo => {
-            check_greater_than(negate, false, true, left, right)
+            check_greater_than(assertion, false, true, left, right)
         }
     }
 }
 
-fn check_greater_than(negate: bool, greater: bool, or_equal: bool, left: Vec<Value>, right: Vec<Value>) -> AssertionResult {
+fn check_greater_than(assertion: &Assertion, greater: bool, or_equal: bool, left: Vec<Value>, right: Vec<Value>) -> AssertionResult {
     if left.len() == right.len() && left.len() == 1 {
         let left_item = left.get(0).unwrap().as_number();
         let right_item = right.get(0).unwrap().as_number();
@@ -181,32 +182,32 @@ fn check_greater_than(negate: bool, greater: bool, or_equal: bool, left: Vec<Val
             } else {
                 if or_equal { left_item.unwrap().as_f64().le(&right_item.unwrap().as_f64()) } else { left_item.unwrap().as_f64().lt(&right_item.unwrap().as_f64()) }
             };
-            if success ^ negate {
-                AssertionResult::of_success()
+            if success ^ assertion.negate {
+                AssertionResult::of_success(assertion.id.to_string())
             } else {
-                AssertionResult::from_error(format!("{} is{} {} than {} {}",
-                                                    as_string(left), if negate { "" } else { " not" },
-                                                    if greater {"greater"} else {"less"}, if or_equal {"or equal to"} else {""}, as_string(right)))
+                AssertionResult::from_error(assertion.id.to_string(),format!("{} is{} {} than {} {}",
+                                                                             as_string(left), if assertion.negate { "" } else { " not" },
+                                                                             if greater {"greater"} else {"less"}, if or_equal {"or equal to"} else {""}, as_string(right)))
             }
         } else {
-            AssertionResult::from_error(format!("{} and {} cannot be compared as numbers", as_string(left), as_string(right)))
+            AssertionResult::from_error(assertion.id.to_string(),format!("{} and {} cannot be compared as numbers", as_string(left), as_string(right)))
         }
     } else {
-        AssertionResult::from_error("Lists cannot be compared as numbers!".to_string())
+        AssertionResult::from_error(assertion.id.to_string(),"Lists cannot be compared as numbers!".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Expression;
     use serde_json::json;
+    use crate::json_path::model::Expression;
+
     #[test]
     fn equality_check() {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
             right: AssertionItem::from_value(Value::String("a message".to_string())),
@@ -231,7 +232,6 @@ mod tests {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
             right: AssertionItem::from_value(Value::String("a message".to_string())),
@@ -256,7 +256,6 @@ mod tests {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
             right: AssertionItem::from_value(Value::String("message".to_string())),
@@ -281,7 +280,6 @@ mod tests {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.messages".to_string() }),
             right: AssertionItem::from_value(Value::String("a message".to_string())),
@@ -306,7 +304,6 @@ mod tests {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }),
             right: AssertionItem::from_value(json!(5)),
@@ -331,7 +328,6 @@ mod tests {
         let assertion = Assertion {
             customer_id: "".to_string(),
             test_case_id: "".to_string(),
-            action_id: "".to_string(),
             id: "".to_string(),
             left: AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }),
             right: AssertionItem::from_value(json!(5)),

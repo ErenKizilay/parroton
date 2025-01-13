@@ -1,19 +1,23 @@
-use crate::models::{Run, RunStatus};
-use crate::persistence::repo::{build_composite_key, QueryResult, Table};
-use aws_sdk_dynamodb::primitives::DateTime;
+use std::cmp::Ordering;
+use crate::persistence::repo::{build_composite_key, OnDeleteMessage, QueryResult, Table};
+use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
 use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
+use serde_dynamo::aws_sdk_dynamodb_1::to_attribute_value;
 use crate::api::{AppError};
+use crate::assertion::model::AssertionResult;
+use crate::persistence::repo::OnDeleteMessage::RunDeleted;
+use crate::run::model::{Run, RunStatus};
 
 pub struct RunOperations {
     pub(crate) client: Arc<Client>,
 }
 
-struct RunTable();
+pub struct RunTable();
 
 impl Table<Run> for RunTable {
     fn table_name() -> String {
@@ -44,6 +48,16 @@ impl Table<Run> for RunTable {
             "started_at".to_string(),
             AttributeValue::S(entity.started_at.to_string()),
         );
+    }
+
+    fn build_deleted_event(entity: Run) -> Option<OnDeleteMessage> {
+        Some(RunDeleted(entity))
+    }
+
+    fn ordering(e1: &Run, e2: &Run) -> Ordering {
+        let started_at1 = DateTime::from_str(e1.started_at.as_str(), DateTimeWithOffset).unwrap();
+        let started_at2 = DateTime::from_str(e2.started_at.as_str(), DateTimeWithOffset).unwrap();
+        started_at2.cmp(&started_at1)
     }
 }
 
@@ -80,6 +94,7 @@ impl RunOperations {
         test_case_id: &String,
         id: &String,
         status: &RunStatus,
+        assertion_results: Vec<AssertionResult>,
     ) {
         RunTable::update_builder(self.client.clone())
             .set_key(Some(RunTable::unique_key(
@@ -88,6 +103,7 @@ impl RunOperations {
             )))
             .expression_attribute_names("#fa", "finished_at")
             .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#ar", "assertion_results")
             .expression_attribute_values(
                 ":s",
                 AttributeValue::S(
@@ -101,7 +117,8 @@ impl RunOperations {
                 ":fa",
                 AttributeValue::S(DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap()),
             )
-            .update_expression("SET #fa = :fa, #s = :s")
+            .expression_attribute_values(":ar", to_attribute_value(assertion_results).unwrap())
+            .update_expression("SET #fa = :fa, #s = :s, #ar = :ar")
             .send()
             .await
             .unwrap();

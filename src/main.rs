@@ -1,13 +1,16 @@
 mod har_resolver;
 mod http;
-mod models;
-mod routes;
-mod json_path_utils;
-mod execution;
-mod assertions;
-mod persistence;
 mod api;
 mod proxy;
+mod auth;
+mod assertion;
+mod run;
+mod case;
+mod parameter;
+mod action_execution;
+mod action;
+mod persistence;
+mod json_path;
 
 use crate::api::build_api;
 

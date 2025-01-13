@@ -15,7 +15,7 @@ serde = { version = "1.0.216", features = ["derive"] }
 uuid = { version = "1.11.0", features = ["v4"] }
 aws-sdk-dynamodb = "1.55.0"
 serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
-aws-config = "1.5.10"
+aws-config = { version = "1.5.10", features = ["behavior-version-latest"] }
 axum = { version = "0.7.9", features = ["default", "multipart", "form"] }
 tower-http = { version = "0.6.2", features = ["full"] }
 thiserror = "2.0.8"

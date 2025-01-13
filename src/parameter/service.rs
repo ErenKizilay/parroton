@@ -1,12 +1,13 @@
-use crate::models::{Expression, Parameter, ParameterLocation, ParameterType};
-use crate::persistence::repo::{build_composite_key, PageKey, ParameterIn, QueryResult, Table};
+use crate::api::AppError;
+use crate::persistence::repo::{build_composite_key, PageKey, QueryResult, Table};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
-use serde_dynamo::aws_sdk_dynamodb_1::from_item;
 use serde_dynamo::to_attribute_value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::api::AppError;
+use tracing::info;
+use crate::json_path::model::Expression;
+use crate::parameter::model::{Parameter, ParameterIn, ParameterLocation, ParameterType};
 
 pub(crate) struct ParametersTable();
 
@@ -36,8 +37,8 @@ impl Table<Parameter> for ParametersTable {
 
     fn sort_key_from_entity(entity: &Parameter) -> (String, AttributeValue) {
         Self::sort_key(build_composite_key(vec![
-            entity.id.clone(),
             entity.action_id.clone(),
+            entity.id.clone(),
         ]))
     }
 
@@ -176,36 +177,17 @@ impl ParameterOperations {
 
     pub async fn update_expression(&self, customer_id: String, test_case_id: String, action_id: String, id: String,
                                    expression: Option<Expression>) -> Result<Parameter, AppError> {
-        let result = ParametersTable::update_builder(self.client.clone())
-            .set_key(Some(ParametersTable::unique_key(
-                build_composite_key(vec![customer_id, test_case_id]),
-                build_composite_key(vec![action_id, id]),
-            )))
-            .expression_attribute_names("#expr", "value_expression")
-            .expression_attribute_values(
-                ":expr",
-                to_attribute_value(expression).unwrap(),
-            )
-            .update_expression("SET #expr = :expr")
-            .send()
-            .await;
-        match result {
-            Ok(output) => {
-                match output.attributes {
-                    Some(attributes) => {
-                        Ok(from_item(attributes).unwrap())
-                    }
-                    None => {
-                        Err(AppError::NotFound("parameter not found".to_string()))
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::error!(error = ?err);
-                Err(AppError::Internal(err.to_string()))
-
-            }
-        }
+        info!("{:?}", expression);
+        info!("cid: {}, tid: {}, aid: {}, id: {}", customer_id, test_case_id, action_id, id);
+        let attribute_value = expression.map_or(AttributeValue::Null(true), |new_expr| to_attribute_value(new_expr).unwrap());
+        info!("attribute_value: {:?}", attribute_value);
+        ParametersTable::update_partial(build_composite_key(vec![customer_id, test_case_id]),
+                                        build_composite_key(vec![action_id, id]),
+                                        self.client.clone()
+                                            .update_item()
+                                            .update_expression("SET #expr = :expr")
+                                            .expression_attribute_names("#expr", "value_expression")
+                                            .expression_attribute_values(":expr", attribute_value)).await
     }
 }
 
