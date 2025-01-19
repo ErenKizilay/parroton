@@ -1,23 +1,26 @@
 use crate::action::model::Action;
 use crate::action_execution::model::ActionExecution;
 use crate::api::AppError;
+use crate::assertion::check::check_assertion;
 use crate::assertion::model::AssertionResult;
+use crate::auth::model::ListAuthProvidersRequest;
 use crate::http::{
     ApiClient, Endpoint, HttpError, HttpMethod, HttpRequest, HttpResult, ReqBody, ReqParam,
 };
+use crate::json_path::model::Expression;
+use crate::json_path::utils::{evaluate_expression, evaluate_value, reverse_flatten_all};
 use crate::parameter::model::{Parameter, ParameterIn};
 use crate::persistence::repo::Repository;
 use crate::run::model::{Run, RunStatus};
+use aws_sdk_dynamodb::config::retry::ShouldAttempt::No;
 use aws_sdk_dynamodb::primitives::DateTime;
 use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
 use serde_json::{Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
-use tracing::info;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info};
 use uuid::Uuid;
-use crate::assertion::check::check_assertion;
-use crate::json_path::utils::{evaluate_value, reverse_flatten_all};
 
 pub struct RunTestCaseCommand {
     pub customer_id: String,
@@ -41,18 +44,15 @@ pub async fn run_test(
                 }
                 Some(test_case) => {
                     info!("Running case {}", test_case.id);
-                    let run_id = Uuid::new_v4().to_string();
                     let run = repo.runs()
-                        .create(Run {
-                            customer_id: command.customer_id.clone(),
-                            test_case_id: command.test_case_id.clone(),
-                            id: run_id,
-                            status: RunStatus::InProgress,
-                            started_at: DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap(),
-                            finished_at: None,
-                            assertion_results: None,
-                        })
+                        .create(Run::builder()
+                            .customer_id(command.customer_id.clone())
+                            .test_case_id(command.test_case_id.clone())
+                            .status(RunStatus::InProgress)
+                            .started_at(current_timestamp())
+                            .build())
                         .await;
+
                     let cloned_run = run.clone();
                     let repo_cloned = Arc::clone(&repo);
                     let api_client_cloned = Arc::clone(&api_client);
@@ -115,7 +115,7 @@ async fn execute(
     );
     let run_cloned = run.clone();
     let action_cloned = action.clone();
-    let started_at = SystemTime::now();
+    let started_at = current_timestamp();
     let http_request =
         build_http_request(&repository, action, &Value::Object(context.clone())).await;
     let request_body = resolve_request_body_from_request(&http_request);
@@ -129,29 +129,29 @@ async fn execute(
             .unwrap()
             .as_millis()
     );
-    let finished_at = SystemTime::now();
+    let finished_at = current_timestamp();
     let arc_repo_clone = Arc::clone(&repository);
     let status_code = resolve_status_code(&result);
     let error = resolve_error_from_result(&result);
     let response_body = resolve_response_from_result(&result);
     let request_body_cloned = request_body.clone();
     tokio::spawn(async move {
+        let action_execution = ActionExecution::builder()
+            .run_id(run_cloned.id.clone())
+            .customer_id(run_cloned.customer_id.clone())
+            .test_case_id(run_cloned.test_case_id.clone())
+            .action_id(action_cloned.id.clone())
+            .status_code(status_code)
+            .maybe_error(error)
+            .started_at(started_at)
+            .finished_at(finished_at)
+            .maybe_response_body(response_body)
+            .maybe_request_body(request_body_cloned)
+            .query_params(req_params)
+            .build();
         arc_repo_clone
             .action_executions()
-            .create(ActionExecution {
-                run_id: run_cloned.id.clone(),
-                customer_id: run_cloned.customer_id.clone(),
-                test_case_id: run_cloned.test_case_id.clone(),
-                action_id: action_cloned.id.clone(),
-                id: Uuid::new_v4().to_string(),
-                status_code,
-                error,
-                started_at: DateTime::from(started_at).fmt(DateTimeWithOffset).unwrap(),
-                finished_at: DateTime::from(finished_at).fmt(DateTimeWithOffset).unwrap(),
-                response_body,
-                request_body: request_body_cloned,
-                query_params: req_params,
-            })
+            .create(action_execution)
             .await;
     });
     let action_context = match result {
@@ -219,11 +219,11 @@ async fn build_http_request(
     let req_params = build_http_params(&parameters, context, ParameterIn::Query);
     let mut headers = build_http_params(&parameters, context, ParameterIn::Header);
     repository.auth_providers()
-        .list(
-            &action.customer_id,
-            Some(action.test_case_id.clone()),
-            Some(obtain_base_url(&action.url)),
-        )
+        .list(ListAuthProvidersRequest::builder()
+            .customer_id(action.customer_id.clone())
+            .test_case_id(action.test_case_id.clone())
+            .base_url(obtain_base_url(&action.url))
+            .build())
         .await
         .unwrap().items
         .iter()
@@ -239,7 +239,7 @@ async fn build_http_request(
     let req_body = build_http_request_body(&parameters, context);
     let endpoint = Endpoint::new(
         HttpMethod::from_str(&action.method).unwrap(),
-        action.url.clone(),
+        build_http_url(&action.url, context),
         vec![],
         req_params,
         headers,
@@ -287,6 +287,24 @@ fn build_http_params(
         .collect()
 }
 
+fn build_http_url(
+    raw_url: &String,
+    context: &Value,
+) -> String {
+    raw_url.split("/")
+        .map(|part|{
+            if part.starts_with("$.") {
+                evaluate_expression(context, &Expression {
+                    value: part.to_string(),
+                }).map_or("".to_string(), |value| {value.get(0)
+                    .map_or("".to_string(), |v| v.to_string().trim_matches('"').to_string())})
+            } else {
+                part.to_string()
+            }
+        }).collect::<Vec<String>>()
+        .join("/")
+}
+
 fn build_http_request_body(
     parameters: &Vec<Parameter>,
     context: &Value,
@@ -297,7 +315,7 @@ fn build_http_request_body(
         .map(|parameter: &Parameter| (parameter, evaluate_value(parameter, context)))
         .filter(|(parameter, eval_result)| {
             if let Err(err) = eval_result {
-                println!(
+                error!(
                     "could not eval for param: {:?}, error: {}",
                     parameter.get_path(),
                     err
@@ -336,34 +354,33 @@ fn obtain_base_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json_path::model::Expression;
     use crate::parameter::model::{ParameterLocation, ParameterType};
     use serde_json::json;
-    use crate::json_path::model::Expression;
 
     #[test]
     fn test_build_request_body() {
-        let param_with_expression = Parameter {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            action_id: "".to_string(),
-            id: "".to_string(),
-            parameter_type: ParameterType::Input,
-            location: ParameterLocation::Body(String::from("$.x.y.z")),
-            value: Default::default(),
-            value_expression: Some(Expression {
+        let param_with_expression = Parameter::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .action_id("".to_string())
+            .parameter_type(ParameterType::Input)
+            .location(ParameterLocation::Body(String::from("$.x.y.z")))
+            .value(Default::default())
+            .value_expression(Expression {
                 value: String::from("$.action1.output.aMap.inner.aField"),
-            }),
-        };
-        let param_with_no_expression = Parameter {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            action_id: "".to_string(),
-            id: "".to_string(),
-            parameter_type: ParameterType::Input,
-            location: ParameterLocation::Body(String::from("$.aList[0]")),
-            value: json!("anItem"),
-            value_expression: None,
-        };
+            })
+            .build();
+
+        let param_with_no_expression = Parameter::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .action_id("".to_string())
+            .parameter_type(ParameterType::Input)
+            .location(ParameterLocation::Body(String::from("$.aList[0]")))
+            .value(json!("anItem"))
+            .build();
+
         let parameters = vec![param_with_expression, param_with_no_expression];
         let context = json!({
             "action1": {
@@ -391,28 +408,24 @@ mod tests {
 
     #[test]
     fn test_build_http_param() {
-        let param_with_expression = Parameter {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            action_id: "".to_string(),
-            id: "".to_string(),
-            parameter_type: ParameterType::Input,
-            location: ParameterLocation::Query(String::from("nextPage")),
-            value: Default::default(),
-            value_expression: Some(Expression {
-                value: String::from("$.action1.output.pageKey"),
-            }),
-        };
-        let param_with_no_expression = Parameter {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            action_id: "".to_string(),
-            id: "".to_string(),
-            parameter_type: ParameterType::Input,
-            location: ParameterLocation::Header(String::from("x-header1")),
-            value: json!("header-val1"),
-            value_expression: None,
-        };
+        let param_with_expression = Parameter::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .action_id("".to_string())
+            .parameter_type(ParameterType::Input)
+            .location(ParameterLocation::Query(String::from("nextPage")))
+            .value(Default::default())
+            .value_expression(Expression { value: String::from("$.action1.output.pageKey") })
+            .build();
+
+        let param_with_no_expression = Parameter::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .action_id("".to_string())
+            .parameter_type(ParameterType::Input)
+            .location(ParameterLocation::Header(String::from("x-header1")))
+            .value(json!("header-val1"))
+            .build();
         let parameters = vec![param_with_expression, param_with_no_expression];
         let context = json!({
             "action1": {
@@ -432,4 +445,8 @@ mod tests {
             value: "header-val1".to_string(),
         }]);
     }
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }

@@ -1,13 +1,12 @@
-use std::cmp::Ordering;
+use crate::action::service::ActionsTable;
+use crate::action_execution::model::{ActionExecution, ActionExecutionPair};
 use crate::api::AppError;
 use crate::persistence::repo::{build_composite_key, Table};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
-use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
-use crate::action::service::ActionsTable;
-use crate::action_execution::model::{ActionExecution, ActionExecutionPair};
 
 pub struct ActionExecutionsOperations {
     pub(crate) client: Arc<Client>,
@@ -47,14 +46,16 @@ impl Table<ActionExecution> for ActionExecutionTable {
     ) {
         item.insert(
             "started_at".to_string(),
-            AttributeValue::S(entity.started_at.to_string()),
+            entity.started_at.map_or(AttributeValue::Null(true), |s|AttributeValue::N(s.to_string()))
+        );
+        item.insert(
+            "finished_at".to_string(),
+            entity.finished_at.map_or(AttributeValue::Null(true), |s|AttributeValue::N(s.to_string()))
         );
     }
 
     fn ordering(e1: &ActionExecution, e2: &ActionExecution) -> Ordering {
-        let started_at1 = DateTime::from_str(e1.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
-        let started_at2 = DateTime::from_str(e2.started_at.as_str(), DateTimeFormat::DateTimeWithOffset).unwrap();
-        started_at1.cmp(&started_at2)
+        e1.started_at.cmp(&e2.started_at)
     }
 }
 

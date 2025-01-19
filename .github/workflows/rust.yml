@@ -13,6 +13,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: eu-central-1  # Change to your AWS region
+        run: |
+          echo "Configuring AWS credentials..."
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set region $AWS_REGION        
 
       # Set up caching for Cargo dependencies
       - name: Cache Cargo dependencies

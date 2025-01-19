@@ -1,10 +1,11 @@
-use axum::extract::{Path, Query, State};
-use axum::Json;
-use serde::Deserialize;
 use crate::api::{ApiResponse, AppError};
 use crate::json_path::model::Expression;
 use crate::parameter::model::{Parameter, ParameterIn, ParameterType};
-use crate::persistence::repo::{QueryResult, Repository};
+use crate::persistence::model::QueryResult;
+use crate::persistence::repo::Repository;
+use axum::extract::{Path, Query, State};
+use axum::Json;
+use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
 pub struct ParameterQueryParams {

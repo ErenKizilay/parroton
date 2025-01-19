@@ -7,6 +7,7 @@ use crate::auth::service::AuthProviderOperations;
 use crate::case::model::TestCase;
 use crate::case::service::TestCaseOperations;
 use crate::parameter::service::ParameterOperations;
+use crate::persistence::model::{ListItemsRequest, PageKey, QueryResult};
 use crate::run::model::Run;
 use crate::run::service::RunOperations;
 use aws_config::meta::region::RegionProviderChain;
@@ -21,58 +22,25 @@ use aws_sdk_dynamodb::operation::update_item::{UpdateItemError, UpdateItemOutput
 use aws_sdk_dynamodb::types::builders::UpdateBuilder;
 use aws_sdk_dynamodb::types::{AttributeValue, ComparisonOperator, Condition, DeleteRequest, KeysAndAttributes, PutRequest, ReturnValue, WriteRequest};
 use aws_sdk_dynamodb::Client;
+use futures::future::err;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::aws_sdk_dynamodb_1::to_item;
-use serde_dynamo::{from_attribute_value, from_item};
+use serde_dynamo::{from_attribute_value, from_item, to_attribute_value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::fmt::Debug;
+use std::sync::{Arc, Once};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
-use tracing::info;
+use tracing::{info, Instrument};
 
-pub struct PageKey {
-    keys: HashMap<String, String>,
-}
+pub static INIT: Once = Once::new();
 
-impl PageKey {
-    pub fn from_attribute_values(values: HashMap<String, AttributeValue>) -> Self {
-        let mut keys: HashMap<String, String> = HashMap::new();
-        values.iter().for_each(|(k, v)| {
-            keys.insert(
-                k.to_string(),
-                v.as_s().map_or(String::new(), |v| v.to_string()),
-            );
-        });
-        Self { keys }
-    }
-
-    pub fn to_attribute_values(&self) -> HashMap<String, AttributeValue> {
-        let mut keys: HashMap<String, AttributeValue> = HashMap::new();
-        self.keys.iter().for_each(|(k, v)| {
-            keys.insert(k.to_string(), AttributeValue::S(v.to_string()));
-        });
-        keys
-    }
-
-    pub fn to_next_page_key(&self) -> String {
-        serde_json::to_string(&self.keys).unwrap()
-    }
-
-    pub fn from_next_page_key(keys: &String) -> Self {
-        Self {
-            keys: serde_json::from_str(&keys).unwrap(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Debug)]
-pub struct QueryResult<T>
-where
-    T: DeserializeOwned + Serialize + Clone,
-{
-    pub items: Vec<T>,
-    pub next_page_key: Option<String>,
+pub fn init_logger() {
+    INIT.call_once(|| {
+        tracing_subscriber::fmt::init();
+    });
 }
 
 pub(crate) trait Table<T>
@@ -126,6 +94,10 @@ where
             .unwrap()
     }
 
+    fn build_exclusion_key(key: Option<String>) -> Option<HashMap<String, AttributeValue>> {
+        key.map(|k| { PageKey::from_next_page_key(&k).to_attribute_values() })
+    }
+
     async fn get_item(
         client: Arc<Client>,
         partition_key: String,
@@ -143,7 +115,7 @@ where
                 Some(item_map) => Ok(Some(from_item(item_map).unwrap())),
                 None => Ok(None),
             },
-            Err(e) => Err(AppError::Internal(e.to_string())),
+            Err(e) => Err(from_sdk_error(e)),
         }
     }
 
@@ -152,6 +124,10 @@ where
         sort_key: String,
         update_builder: UpdateItemFluentBuilder,
     ) -> Result<T, AppError> {
+        let mut update_expression = update_builder.get_update_expression().clone()
+            .unwrap();
+        update_expression.push_str(format!("{} #updated_at = :updated_at", if update_expression.contains("SET") { "," } else { " SET" }).as_str());
+        info!("will update partially {}|{} with expr: {:?}, attribute names: {:?}, attributes values: {:?}", partition_key, sort_key, update_expression, update_builder.get_expression_attribute_names(), update_builder.get_expression_attribute_values());
         let result = update_builder
             .table_name(Self::table_name())
             .set_key(Some(Self::unique_key(
@@ -161,7 +137,10 @@ where
             .return_values(ReturnValue::AllNew)
             .expression_attribute_names("#pk", Self::partition_key_name())
             .expression_attribute_names("#sk", Self::sort_key_name())
+            .expression_attribute_names("#updated_at", "updated_at")
             .condition_expression("attribute_exists(#pk) AND attribute_exists(#sk)")
+            .expression_attribute_values(":updated_at", to_attribute_value(current_timestamp()).unwrap())
+            .update_expression(update_expression)
             .send().await;
         Self::from_update_result(result)
     }
@@ -177,7 +156,7 @@ where
             .await;
         match result {
             Ok(_) => Ok(entity.clone()),
-            Err(err) => Err(AppError::Internal(err.to_string())),
+            Err(err) => Err(from_sdk_error(err)),
         }
     }
 
@@ -186,10 +165,12 @@ where
         partition_key: String,
         sort_key: String,
     ) -> Result<Option<T>, AppError> {
+        info!("{}:will delete: {}|{}", Self::table_name(),  partition_key, sort_key);
         let result = client
             .delete_item()
             .table_name(Self::table_name())
             .set_key(Some(Self::unique_key(partition_key, sort_key)))
+            .return_values(ReturnValue::AllOld)
             .send()
             .await;
         match result {
@@ -198,22 +179,22 @@ where
                     from_attribute_value(AttributeValue::M(item_map)).unwrap(),
                 ))
             }),
-            Err(err) => Err(AppError::Internal(err.to_string())),
+            Err(err) => Err(from_sdk_error(err)),
         }
     }
 
     fn query_builder(client: Arc<Client>) -> QueryFluentBuilder {
         client.query().table_name(Self::table_name())
-    }
-
-    fn update_builder(client: Arc<Client>) -> UpdateItemFluentBuilder {
-        client.update_item().table_name(Self::table_name())
+            .limit(50)
     }
 
     async fn batch_get_items(
         client: Arc<Client>,
         key_pairs: Vec<(String, String)>,
     ) -> Result<Vec<T>, AppError> {
+        if key_pairs.is_empty() {
+            return Ok(vec![]);
+        }
         let keys = key_pairs
             .iter()
             .map(|key_pair| Self::unique_key(key_pair.0.clone(), key_pair.1.clone()))
@@ -246,7 +227,7 @@ where
                         Ok(items)
                     })
             }
-            Err(err) => Err(AppError::Internal(err.to_string())),
+            Err(err) => Err(from_sdk_error(err)),
         }
     }
 
@@ -269,7 +250,9 @@ where
                     }),
                 })
             }
-            Err(err) => Err(AppError::Internal(err.to_string())),
+            Err(err) => {
+                Err(from_sdk_error(err))
+            }
         }
     }
 
@@ -286,23 +269,31 @@ where
                     .unwrap())
             }
             Err(err) => {
-                tracing::error!("{:?}", err);
-                Err(AppError::Internal(err.to_string()))
+                Err(from_sdk_error(err))
             }
         }
     }
 
     async fn list_items(
         client: Arc<Client>,
-        partition_key: String,
-        next_page_key: Option<String>,
+        request: ListItemsRequest,
     ) -> Result<QueryResult<T>, AppError> {
+        let mut expr_attribute_names: HashMap<String, String> = HashMap::from([("#pk".to_string(), Self::partition_key_name())]);
+        request.expression_attribute_names.inspect(|names| {
+            expr_attribute_names.extend(names.clone());
+        });
+        let mut expr_attribute_values: HashMap<String, AttributeValue> = HashMap::from([(":pk".to_string(), AttributeValue::S(request.partition_key))]);
+        request.expression_attribute_values.inspect(|values| {
+            expr_attribute_values.extend(values.clone());
+        });
         let result = Self::query_builder(client)
-            .expression_attribute_names("#pk", Self::partition_key_name())
-            .expression_attribute_values(":pk", AttributeValue::S(partition_key))
+            .set_expression_attribute_names(Some(expr_attribute_names))
+            .set_expression_attribute_values(Some(expr_attribute_values))
             .key_condition_expression("#pk = :pk")
+            .set_filter_expression(request.filter_expression)
+            .limit(request.limit.map_or(25, |limit| { limit }))
             .set_exclusive_start_key(
-                next_page_key.map(|next| PageKey::from_next_page_key(&next).to_attribute_values()),
+                request.next_page_key.map(|next| PageKey::from_next_page_key(&next).to_attribute_values()),
             )
             .send()
             .await;
@@ -318,7 +309,10 @@ where
         let mut items: Vec<T> = vec![];
         loop {
             let result =
-                Self::list_items(client.clone(), partition_key.clone(), next_page_key.clone())
+                Self::list_items(client.clone(), ListItemsRequest::builder()
+                    .partition_key(partition_key.clone())
+                    .maybe_next_page_key(next_page_key.clone())
+                    .build())
                     .await;
             match result {
                 Ok(query_result) => {
@@ -346,20 +340,22 @@ where
     async fn delete_all_items(
         client: Arc<Client>,
         partition_key: String,
-        mut next_page_key: Option<String>,
         sender: &Sender<OnDeleteMessage>,
     ) {
+        info!("{}: will delete all items for partition {}", Self::table_name(), partition_key);
+        let mut next_page_key: Option<String> = None;
         loop {
             let result =
-                Self::list_items(client.clone(), partition_key.clone(), next_page_key.clone())
+                Self::list_items(client.clone(), ListItemsRequest::builder()
+                    .partition_key(partition_key.clone())
+                    .maybe_next_page_key(next_page_key.clone()).build())
                     .await;
             if let Ok(query_result) = result {
                 let mut keys: Vec<(String, String)> = vec![];
                 for item in query_result.items {
-                    let attribute_value = Self::partition_key_from_entity(&item).1;
-                    let partition_key = attribute_value.as_s().unwrap();
-                    let sort_key = attribute_value.as_s().unwrap();
-                    keys.push((partition_key.clone(), sort_key.clone()));
+                    let partition_key = Self::partition_key_from_entity(&item).1;
+                    let sort_key = Self::sort_key_from_entity(&item).1;
+                    keys.push((partition_key.as_s().unwrap().clone(), sort_key.as_s().unwrap().clone()));
                     if let Some(event) = Self::build_deleted_event(item) {
                         let cloned_sender = sender.clone();
                         tokio::task::spawn(async move {
@@ -393,6 +389,7 @@ where
     }
 
     async fn batch_delete_items(client: Arc<Client>, keys: Vec<(String, String)>) {
+        info!("{}:will batch delete {} items!", Self::table_name(), keys.len());
         let cloned_client = client.clone();
         tokio::task::spawn(async move {
             let write_requests: Vec<WriteRequest> = keys
@@ -417,6 +414,7 @@ where
         let sort_key = Self::sort_key_from_entity(&entity);
         item.insert(partition_key.0, partition_key.1);
         item.insert(sort_key.0, sort_key.1);
+        item.insert("created_at".to_string(), AttributeValue::N(current_timestamp().to_string()));
         Self::add_index_key_attributes(&entity, item);
     }
 
@@ -499,6 +497,7 @@ async fn batch_write(client: Arc<Client>, write_requests: Vec<WriteRequest>, tab
     for write_chunk in chunks {
         let cloned_client = client.clone();
         let table_name_cloned = table_name.clone();
+        let table_name_cloned2 = table_name.clone();
         tokio::task::spawn(async move {
             let result = cloned_client
                 .batch_write_item()
@@ -507,21 +506,34 @@ async fn batch_write(client: Arc<Client>, write_requests: Vec<WriteRequest>, tab
                 .await;
             match result {
                 Ok(_) => {
-                    tracing::info!("batch_write_item ok");
+                    info!("{}:batch_write_item ok", table_name_cloned2);
                 }
                 Err(err) => {
-                    println!(
-                        "batch write error: {}",
-                        err.into_service_error().message().unwrap_or_default()
-                    );
+                    println!("{}: batch write error: {}", table_name_cloned2, err.into_service_error().message().unwrap_or_default());
                 }
             }
         });
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum OnDeleteMessage {
     TestCaseDeleted(TestCase),
     ActionDeleted(Action),
     RunDeleted(Run),
+}
+
+pub fn current_timestamp() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn from_sdk_error<T>(sdk_err: SdkError<T>) -> AppError
+where
+    T: Debug,
+    T: ProvideErrorMetadata,
+{
+    tracing::error!("aws dynamodb sdk error: {:?}", sdk_err);
+    let message = sdk_err.message()
+        .map_or_else(|| sdk_err.to_string(), |err| { err.to_string() });
+    AppError::Internal(message)
 }

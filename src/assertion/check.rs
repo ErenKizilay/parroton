@@ -1,7 +1,6 @@
-
-use serde_json::Value;
 use crate::assertion::model::{Assertion, AssertionItem, AssertionResult, ComparisonType, Function, Operation, ValueProvider};
 use crate::json_path::utils::evaluate_expression;
+use serde_json::Value;
 
 trait ValueSupplier {
     fn supply(&self, context: &Value) -> Result<Vec<Value>, String>;
@@ -200,20 +199,18 @@ fn check_greater_than(assertion: &Assertion, greater: bool, or_equal: bool, left
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::json_path::model::Expression;
+    use serde_json::json;
 
     #[test]
     fn equality_check() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
-            right: AssertionItem::from_value(Value::String("a message".to_string())),
-            comparison_type: ComparisonType::EqualTo,
-            negate: false,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }))
+            .right(AssertionItem::from_value(json!("a message")))
+            .comparison_type(ComparisonType::EqualTo)
+            .build();
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {
@@ -229,15 +226,15 @@ mod tests {
 
     #[test]
     fn negate_equality_check() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
-            right: AssertionItem::from_value(Value::String("a message".to_string())),
-            comparison_type: ComparisonType::EqualTo,
-            negate: true,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }))
+            .right(AssertionItem::from_value(json!("a message")))
+            .comparison_type(ComparisonType::EqualTo)
+            .negate(true)
+            .build();
+
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {
@@ -253,15 +250,14 @@ mod tests {
 
     #[test]
     fn string_contains() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }),
-            right: AssertionItem::from_value(Value::String("message".to_string())),
-            comparison_type: ComparisonType::Contains,
-            negate: false,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.message".to_string() }))
+            .right(AssertionItem::from_value(json!("message")))
+            .comparison_type(ComparisonType::Contains)
+            .build();
+
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {
@@ -277,15 +273,13 @@ mod tests {
 
     #[test]
     fn list_contains() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.messages".to_string() }),
-            right: AssertionItem::from_value(Value::String("a message".to_string())),
-            comparison_type: ComparisonType::Contains,
-            negate: false,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.messages".to_string() }))
+            .right(AssertionItem::from_value(json!("a message")))
+            .comparison_type(ComparisonType::Contains)
+            .build();
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {
@@ -301,15 +295,13 @@ mod tests {
 
     #[test]
     fn greater_than() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }),
-            right: AssertionItem::from_value(json!(5)),
-            comparison_type: ComparisonType::GreaterThan,
-            negate: false,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }))
+            .right(AssertionItem::from_value(json!(5)))
+            .comparison_type(ComparisonType::GreaterThan)
+            .build();
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {
@@ -325,15 +317,14 @@ mod tests {
 
     #[test]
     fn less_than_fail_case() {
-        let assertion = Assertion {
-            customer_id: "".to_string(),
-            test_case_id: "".to_string(),
-            id: "".to_string(),
-            left: AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }),
-            right: AssertionItem::from_value(json!(5)),
-            comparison_type: ComparisonType::LessThanOrEqualTo,
-            negate: false,
-        };
+        let assertion = Assertion::builder()
+            .customer_id("".to_string())
+            .test_case_id("".to_string())
+            .left(AssertionItem::from_expression(Expression { value: "$.action1.output.count".to_string() }))
+            .right(AssertionItem::from_value(json!(5)))
+            .comparison_type(ComparisonType::LessThanOrEqualTo)
+            .build();
+
         let context = serde_json::to_value(json!({
         "action1": {
                 "output": {

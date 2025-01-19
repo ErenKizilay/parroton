@@ -1,10 +1,3 @@
-use crate::persistence::repo::Repository;
-use har::v1_2::{Entries, Headers, Request};
-use har::Spec;
-use regex::Regex;
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
 use crate::action::model::Action;
 use crate::assertion::model::{Assertion, AssertionItem, ComparisonType};
 use crate::auth::model::{AuthHeaderValue, AuthenticationProvider};
@@ -12,6 +5,14 @@ use crate::case::model::TestCase;
 use crate::har_resolver::FlattenKeyPrefixType::{AssertionExpression, Input, Output};
 use crate::json_path::model::Expression;
 use crate::parameter::model::{Parameter, ParameterLocation, ParameterType};
+use crate::persistence::repo::Repository;
+use har::v1_2::{Entries, Headers, PostData, Request};
+use har::Spec;
+use regex::Regex;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use tracing::{info, warn};
+use uuid::Uuid;
 
 pub async fn build_test_case(
     repository: &Repository,
@@ -34,13 +35,13 @@ pub async fn build_test_case(
         .enumerate()
         .map(|(i, entry)| build_request_index(i, entry))
         .collect();
-    let case = TestCase {
-        customer_id: customer_id.clone(),
-        id: Uuid::new_v4().to_string(),
-        name: test_case_name.clone(),
-        description: description.clone(),
-    };
-    let created_test_case = repository.test_cases().create_test_case(case).await;
+
+    let case = TestCase::builder()
+        .customer_id(customer_id.clone())
+        .name(test_case_name.clone())
+        .description(description.clone())
+        .build();
+    let created_test_case = repository.test_cases().create(case).await;
 
     let mut actions = vec![];
     let existing_auth_providers = if auth_providers.is_empty() {
@@ -56,7 +57,7 @@ pub async fn build_test_case(
     for i in 0..entries.len() {
         let current = entries.get(i).unwrap();
         println!("{:#?}", current.request.url);
-        let action = build_action(i, &created_test_case, current);
+        let action = build_action(i, &created_test_case, current, &response_indexes);
         let input_parameters = build_action_input(&action, &current.request, &response_indexes);
         let output_parameters = build_output_parameters(&action, current);
         let assertions = build_assertions(&action, &request_indexes, &response_indexes);
@@ -90,18 +91,36 @@ pub async fn build_test_case(
 }
 
 pub fn filter_entries(excluded_path_parts: Vec<String>, spec: &Spec) -> Vec<&Entries> {
-    println!("{:?}", excluded_path_parts.clone());
-    println!("{:?}", excluded_path_parts.is_empty());
+    let exclusions: Vec<String> = excluded_path_parts.iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    info!("{:?}", excluded_path_parts.clone());
     match spec {
         Spec::V1_2(log_v1) => {
             let entries: Vec<&Entries> = log_v1
                 .entries
                 .iter()
                 .filter(|entry| {
-                    excluded_path_parts.is_empty()
-                        || !excluded_path_parts
-                            .iter()
-                            .any(|part| entry.request.url.contains(part))
+                    exclusions.is_empty()
+                        || !exclusions
+                        .iter()
+                        .any(|part| entry.request.url.contains(part))
+                })
+                .filter(|entry| {
+                    let request = &entry.request;
+                    match &request.post_data {
+                        None => {
+                            true
+                        }
+                        Some(post_data) => {
+                            post_data.mime_type.contains("json") || post_data.mime_type.contains("form-urlencoded")
+                        }
+                    }
+                })
+                .filter(|entry| {
+                    let response = &entry.response;
+                    let mime_type_opt = response.content.mime_type.clone();
+                    mime_type_opt.map_or(true, |mime_type| mime_type.contains("json"))
                 })
                 .collect();
             entries
@@ -128,38 +147,65 @@ async fn create_auth_providers(
             });
             let mut test_case_ids = HashSet::new();
             test_case_ids.insert(created_test_case.id.clone());
-            AuthenticationProvider {
-                customer_id: created_test_case.customer_id.clone(),
-                id: Uuid::new_v4().to_string(),
-                base_url: base_url.clone(),
-                headers_by_name: headers_by_name.clone(),
-                linked_test_case_ids: test_case_ids,
-            }
+            AuthenticationProvider::builder()
+                .customer_id(created_test_case.customer_id.clone())
+                .name(build_auth_name_from_url(base_url))
+                .base_url(base_url.clone())
+                .headers_by_name(headers_by_name)
+                .linked_test_case_ids(test_case_ids)
+                .build()
         })
         .collect::<Vec<AuthenticationProvider>>();
     repository
         .auth_providers()
-        .batch_create_auth_providers(auth_providers)
+        .batch_create(auth_providers)
         .await;
 }
 
-fn build_action(order: usize, test_case: &TestCase, entry: &Entries) -> Action {
-    let action_name = build_action_name(order, &entry.request);
-    Action {
-        customer_id: test_case.customer_id.clone(),
-        test_case_id: test_case.id.clone(),
-        id: uuid::Uuid::new_v4().to_string(),
-        order: order,
-        url: build_url_without_query_params(&entry.request.url),
-        name: action_name.clone(),
-        mime_type: resolve_mime_type(entry),
-        method: entry.request.method.clone(),
+fn build_auth_name_from_url(base_url: &String) -> String {
+    let re = Regex::new(r"[./]").unwrap();
+    let parts: Vec<&str> = re.split(base_url).collect();
+    let mut name: String = "".to_string();
+    for i in 1..parts.len() - 1 {
+        name.push_str(format!(" {}", parts[i]).as_str());
     }
+    name.trim().to_string()
 }
 
-fn build_url_without_query_params(url: &String) -> String {
+fn build_action(order: usize, test_case: &TestCase, entry: &Entries, response_indexes: &Vec<HashMap<String, Value>>) -> Action {
+    let action_name = build_action_name(order, &entry.request);
+    Action::builder()
+        .customer_id(test_case.customer_id.clone())
+        .test_case_id(test_case.id.clone())
+        .order(order)
+        .name(action_name.clone())
+        .maybe_mime_type(resolve_mime_type(entry))
+        .method(entry.request.method.clone())
+        .url(build_url_without_query_params(order, &entry.request.url, response_indexes))
+        .build()
+}
+
+fn build_url_without_query_params(order: usize, url: &String, response_indexes: &Vec<HashMap<String, Value>>) -> String {
     let re = Regex::new(r"\?.*$").unwrap();
-    re.replace(url, "").to_string()
+    let url = re.replace(url, "").to_string();
+    let base_url = obtain_base_url(url.as_str());
+
+    let path = url.clone().replace(base_url.as_str(), "");
+
+    println!("path: {:#?}", path);
+
+    let path_with_expressions = path.split("/")
+        .map(|s| {
+            if s.is_empty() {
+                "".to_string()
+            } else {
+                resolve_value_expression_from_prev(order, &Value::String(s.to_string()), response_indexes)
+                    .map_or(s.to_string(), |expression: Expression| { expression.value })
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("/");
+    format!("{}{}", base_url, path_with_expressions)
 }
 
 fn resolve_mime_type(entry: &Entries) -> Option<String> {
@@ -176,8 +222,16 @@ fn build_response_index(order: usize, entry: &Entries) -> HashMap<String, Value>
     let option = &content.text;
     option.as_ref().map_or(HashMap::new(), |text| {
         let action_name = build_action_name(order, &entry.request);
-        let response_value = serde_json::from_str::<Value>(&text).unwrap();
-        build_response_index_from_value(&action_name, &response_value)
+        info!("building response index for: {:?} and mime_type: {:?} content: {:?}", action_name, content.mime_type, text);
+        match serde_json::from_str::<Value>(&text) {
+            Ok(response_value) => {
+                build_response_index_from_value(&action_name, &response_value)
+            }
+            Err(e) => {
+                warn!("Empty index will be created for action: {:?} and mime_type: {:?} content: {:?}", action_name, content.mime_type, e);
+                HashMap::new()
+            }
+        }
     })
 }
 
@@ -217,8 +271,14 @@ fn build_output_parameters(action: &Action, entry: &Entries) -> Vec<Parameter> {
     let option = &content.text;
     let mut parameters = vec![];
     option.as_ref().iter().for_each(|text| {
-        let response_value = serde_json::from_str::<Value>(&text).unwrap();
-        parameters.extend(build_output_parameters_from_value(&action, &response_value));
+        match serde_json::from_str::<Value>(&text) {
+            Ok(response_value) => {
+                parameters.extend(build_output_parameters_from_value(&action, &response_value));
+            }
+            Err(e) => {
+                warn!("Will not create output parameters for action: {:?} and mime_type: {:?} and content: {:?}, error: {:?}", action.name, content.mime_type, text, e);
+            }
+        }
     });
     parameters
 }
@@ -273,6 +333,7 @@ fn build_request_index(order: usize, entry: &Entries) -> HashMap<String, Value> 
 
 fn build_action_name(order: usize, request: &Request) -> String {
     let url = &request.url;
+    info!("building action name for: {:?}", url);
     build_action_name_from_url(order, url)
 }
 
@@ -280,7 +341,28 @@ pub fn build_action_name_from_url(order: usize, url: &String) -> String {
     let formatted_name = url.replace("-", "_");
     let base_name = formatted_name.split("/").last().unwrap();
     let re = Regex::new(r"\?.*$").unwrap(); // Matches '?' and everything after it
-    format!("{}_{}", re.replace(base_name, "").to_string(), order)
+    let suffix = re.find_iter(base_name)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.as_str().to_string().split("=")
+            .last()
+            .map_or_else(|| "".to_string(), |v| v.to_string()))
+        .filter(|v| !v.is_empty())
+        .filter(|s| !s.chars().all(char::is_numeric))
+        .map(|v| v.chars().map(|c|{
+            if c.is_uppercase() {
+                format!("_{}", c.to_lowercase())
+            } else {
+                c.to_string()
+            }
+        }).collect::<Vec<String>>().join(""))
+        .take(2)
+        .collect::<Vec<String>>()
+        .join("_");
+    if suffix.is_empty() {
+        format!("{}_{}", re.replace(base_name, "").to_string(), order)
+    } else {
+        format!("{}{}_{}", re.replace(base_name, "").to_string(), suffix, order)
+    }
 }
 
 fn build_action_input(
@@ -291,10 +373,8 @@ fn build_action_input(
     let mut query_params = build_query_parameters(action, request, response_indexes);
     let body_params = build_body_parameters(action, request, response_indexes);
     let header_params = build_header_parameters(action, request, response_indexes);
-    let cookie_params = build_cookie_parameters(action, request, response_indexes);
     query_params.extend(body_params);
     query_params.extend(header_params);
-    //query_params.extend(cookie_params);
     query_params
 }
 
@@ -316,17 +396,16 @@ pub fn build_assertions(
                     let expression_result =
                         resolve_value_expression_from_slice_index(&res_value, &slice);
                     if let Some(expression) = expression_result {
-                        let assertion = Assertion {
-                            customer_id: action.customer_id.clone(),
-                            test_case_id: action.test_case_id.clone(),
-                            id: Uuid::new_v4().to_string(),
-                            left: AssertionItem::from_expression(expression),
-                            right: AssertionItem::from_expression(Expression {
+                        let assertion = Assertion::builder()
+                            .customer_id(action.customer_id.clone())
+                            .test_case_id(action.test_case_id.clone())
+                            .left(AssertionItem::from_expression(expression))
+                            .right(AssertionItem::from_expression(Expression {
                                 value: path.to_string(),
-                            }),
-                            comparison_type: ComparisonType::EqualTo,
-                            negate: false,
-                        };
+                            }))
+                            .comparison_type(ComparisonType::EqualTo)
+                            .negate(false)
+                            .build();
                         assertions.push(assertion);
                     }
                 }
@@ -337,6 +416,7 @@ pub fn build_assertions(
 
 fn should_build_assertion_for_response_value(res_value: &Value) -> bool {
     let non_assertable_value = res_value.is_boolean()
+        || res_value.is_null()
         || (res_value.is_string() && res_value.as_str().unwrap().len() == 0)
         || (res_value.is_array() && res_value.as_array().unwrap().len() == 0);
     !non_assertable_value
@@ -454,16 +534,15 @@ fn build_parameter(
     location: ParameterLocation,
     parameter_type: ParameterType,
 ) -> Parameter {
-    Parameter {
-        customer_id: action.customer_id.clone(),
-        test_case_id: action.test_case_id.clone(),
-        action_id: action.id.clone(),
-        value_expression: expression,
-        id: uuid::Uuid::new_v4().to_string(),
-        parameter_type: parameter_type,
-        location,
-        value,
-    }
+    Parameter::builder()
+        .customer_id(action.customer_id.clone())
+        .test_case_id(action.test_case_id.clone())
+        .action_id(action.id.clone())
+        .maybe_value_expression(expression)
+        .parameter_type(parameter_type)
+        .location(location)
+        .value(value)
+        .build()
 }
 
 fn build_header_parameters(
@@ -491,7 +570,7 @@ fn build_header_parameter(
     header_name: &String,
     header_val: &String,
 ) -> Option<Parameter> {
-    if is_auth_related_header(&header_name) {
+    if is_auth_related_header(&header_name) || must_exclude_header(&header_name) {
         None
     } else {
         let expression = resolve_value_expression_from_prev(
@@ -519,36 +598,24 @@ fn build_auth_headers(request: &Request) -> HashMap<String, AuthHeaderValue> {
         .for_each(|header| {
             auth_headers_by_name.insert(
                 resolve_header_name(header),
-                AuthHeaderValue {
-                    value: header.value.clone(),
-                    disabled: false,
-                },
+                AuthHeaderValue::builder()
+                    .value(header.value.clone())
+                    .build(),
+            );
+        });
+    println!("cookies: {:?}", request.cookies);
+    request.cookies.iter()
+        .filter(|cookie| is_auth_related_header(&cookie.name))
+        .for_each(|cookie| {
+            info!("cookie: {} value: {}", cookie.name, cookie.value);
+            auth_headers_by_name.insert(
+                cookie.name.clone(),
+                AuthHeaderValue::builder()
+                    .value(cookie.value.clone())
+                    .build(),
             );
         });
     auth_headers_by_name
-}
-
-fn build_cookie_parameters(
-    action: &Action,
-    request: &Request,
-    response_indexes: &Vec<HashMap<String, Value>>,
-) -> Vec<Parameter> {
-    let mut parameters: Vec<Parameter> = vec![];
-    request.cookies.iter().for_each(|cookie| {
-        let expression = resolve_value_expression_from_prev(
-            action.order,
-            &Value::String(cookie.value.clone()),
-            response_indexes,
-        );
-        parameters.push(build_parameter(
-            action,
-            expression,
-            Value::String(cookie.value.clone()),
-            ParameterLocation::Cookie(cookie.name.clone()),
-            ParameterType::Input,
-        ));
-    });
-    parameters
 }
 
 fn resolve_value_expression_from_prev(
@@ -625,8 +692,16 @@ fn is_auth_related_header(key: &String) -> bool {
         "cookie",
         "auth",
     ]
-    .iter()
-    .any(|x| key.contains(x))
+        .iter()
+        .any(|x| key.contains(x))
+}
+
+fn must_exclude_header(key: &String) -> bool {
+    vec![
+        "content-length",
+    ]
+        .iter()
+        .any(|x| key.contains(x))
 }
 
 fn obtain_base_url(url: &str) -> String {
@@ -650,4 +725,54 @@ fn obtain_base_url(url: &str) -> String {
 
 fn resolve_header_name(header: &Headers) -> String {
     header.name.replace(":", "")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn build_header_name() {
+        let provider_name = build_auth_name_from_url(&String::from("https://layima.app.opsgenie.com"));
+        assert_eq!("layima app opsgenie", provider_name.as_str());
+    }
+
+    #[tokio::test]
+    async fn build_auth_headers_test() {
+        let har = har::from_path("resources/test/layima.atlassian.net.har").unwrap();
+        let spec = har.log;
+        match spec {
+            Spec::V1_2(log) => {
+                log.entries.iter()
+                    .for_each(|entries: &Entries| {
+                        let map = build_auth_headers(&entries.request);
+                        println!("{:#?}", map);
+                    })
+            }
+            Spec::V1_3(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn build_action_url() {
+        let action0_index = HashMap::from([(String::from("$.action0.output.issueKey"), Value::String(String::from("TEST-1")))]);
+        let response_indexes: Vec<HashMap<String, Value>> = Vec::from([action0_index]);
+        let actual = build_url_without_query_params(1, &"https://abc.xyz/TEST-1/comment".to_string(), &response_indexes);
+        assert_eq!("https://abc.xyz/$.action0.output.issueKey/comment", actual.as_str());
+    }
+
+    #[tokio::test]
+    async fn test_build_action_url_with_params() {
+        let action0_index = HashMap::from([(String::from("$.action0.output.issueKey"), Value::String(String::from("")))]);
+        let response_indexes: Vec<HashMap<String, Value>> = Vec::from([action0_index]);
+        let actual = build_url_without_query_params(1, &"https://layima.atlassian.net/rest/dev-status/1.0/issue/create-branch-targets?issueId=10000".to_string(), &response_indexes);
+        assert_eq!("https://layima.atlassian.net/rest/dev-status/1.0/issue/create-branch-targets", actual.as_str());
+    }
+
+    #[tokio::test]
+    async fn test_build_action_name() {
+        let actual = build_action_name_from_url(1, &"https://layima.atlassian.net/jsw2/graphql?operation=BoardCardCreate".to_string());
+        assert_eq!("graphql_board_card_create_1", actual.as_str());
+    }
 }

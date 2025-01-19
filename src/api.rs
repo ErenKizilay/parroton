@@ -1,13 +1,18 @@
-use crate::assertion::api::{delete_assertion, get_assertion, list_assertions, put_assertion, update_assertion_comparison, update_assertion_negation};
-use crate::auth::api::{delete_auth_provider, list_auth_providers, set_auth_header_enablement, set_auth_header_value};
+use crate::action::api::list_actions;
+use crate::action_execution::api::get_action_executions;
+use crate::assertion::api::{batch_get_assertions, delete_assertion, get_assertion, list_assertions, put_assertion, update_assertion_comparison, update_assertion_expression, update_assertion_negation};
+use crate::auth::api::{add_auth_header_value, create_auth_provider, delete_auth_provider, get_auth_provider, list_auth_providers, list_auth_providers_with_multiple_urls, set_auth_header_enablement, set_auth_header_value};
+use crate::case::api::{delete_test_case, filter_paths, get_test_case, list_test_cases, update_test_case, update_test_case_description, update_test_case_name, upload_test_case};
 use crate::http::ApiClient;
+use crate::json_path::api::auto_complete;
+use crate::parameter::api::{list_parameters, update_parameter_expression};
 use crate::persistence::repo::Repository;
 use crate::run::api::{get_run, list_runs, run_test_case};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -16,11 +21,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tracing::Level;
-use crate::action::api::list_actions;
-use crate::action_execution::api::get_action_executions;
-use crate::case::api::{delete_test_case, filter_paths, get_test_case, list_test_cases, upload_test_case};
-use crate::json_path::api::auto_complete;
-use crate::parameter::api::{list_parameters, update_parameter_expression};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,20 +58,27 @@ pub async fn build_api() -> Router {
         .route("/test-cases/:id/runs/:run_id", get(get_run))
         .route("/test-cases/:id/run", post(run_test_case))
         .route("/test-cases/:id/runs", get(list_runs))
+        .route("/test-cases/:test_case_id/assertions/:id/:location/expression", patch(update_assertion_expression))
         .route("/test-cases/:test_case_id/assertions/:id/comparison-type", patch(update_assertion_comparison))
         .route("/test-cases/:test_case_id/assertions/:id/negate", patch(update_assertion_negation))
         .route("/test-cases/:test_case_id/assertions/:id", get(get_assertion).delete(delete_assertion))
+        .route("/test-cases/:id/assertions/batch-get", post(batch_get_assertions))
         .route("/test-cases/:id/assertions", get(list_assertions).put(put_assertion))
-        .route("/test-cases/:id", get(get_test_case).delete(delete_test_case))
-        .route("/auth-providers/:id", delete(delete_auth_provider))
+        .route("/test-cases/:id/name", patch(update_test_case_name))
+        .route("/test-cases/:id/description", patch(update_test_case_description))
+        .route("/test-cases/:id", get(get_test_case).delete(delete_test_case).patch(update_test_case))
+        .route("/auth-providers/:id", delete(delete_auth_provider).get(get_auth_provider))
+        .route("/auth-providers/:id/headers", patch(add_auth_header_value))
         .route("/auth-providers/:id/value", patch(set_auth_header_value))
         .route("/auth-providers/:id/disabled", patch(set_auth_header_enablement))
+        .route("/auth-providers", post(create_auth_provider))
         .route("/test-cases", get(list_test_cases).post(upload_test_case))
+        .route("/auth-providers/search-by-urls", post(list_auth_providers_with_multiple_urls))
         .route("/auth-providers", get(list_auth_providers))
         .route("/auto-complete", post(auto_complete))
         .route("/filter-paths", post(filter_paths))
         .layer(cors)
-        .layer(DefaultBodyLimit::max(5003944))
+        .layer(DefaultBodyLimit::max(90003944))
         .layer(TraceLayer::new_for_http()
             .make_span_with(
                 DefaultMakeSpan::new().include_headers(true))
@@ -138,6 +145,7 @@ pub enum AppError {
     Internal(String),
 }
 
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ErrorBody {
     pub message: String,
@@ -174,7 +182,7 @@ impl IntoResponse for AppError {
                     .unwrap()
             }
             AppError::Internal(message) => {
-                tracing::error!("{}", message);
+                //tracing::error!("{}", message);
                 Response::builder()
                     .status(500)
                     .header("Content-Type", "application/json")

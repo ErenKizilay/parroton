@@ -1,11 +1,12 @@
+use crate::action::model::Action;
+use crate::api::AppError;
+use crate::persistence::model::{ListItemsRequest, PageKey, QueryResult};
+use crate::persistence::repo::{build_composite_key, OnDeleteMessage, Table};
+use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::Client;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
-use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::types::AttributeValue;
-use crate::action::model::Action;
-use crate::api::AppError;
-use crate::persistence::repo::{build_composite_key, OnDeleteMessage, PageKey, QueryResult, Table};
 
 pub struct ActionOperations {
     pub(crate) client: Arc<Client>,
@@ -64,8 +65,10 @@ impl ActionOperations {
     ) -> Result<QueryResult<Action>, AppError> {
         ActionsTable::list_items(
             self.client.clone(),
-            build_composite_key(vec![customer_id, test_case_id]),
-            next_page_key,
+            ListItemsRequest::builder()
+                .partition_key(build_composite_key(vec![customer_id, test_case_id]))
+                .maybe_next_page_key(next_page_key)
+                .build()
         )
             .await
     }
