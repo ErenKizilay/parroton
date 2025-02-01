@@ -1,19 +1,17 @@
-use std::collections::HashMap;
-use crate::har_resolver::{build_action_name_from_url, build_assertions, build_body_parameters_from_value, build_output_parameters_from_value, build_query_param, build_request_index_from_value, build_response_index_from_value};
-use crate::http::{ApiClient, HttpRequest, HttpResult};
-use crate::persistence::repo::Repository;
-use axum::http;
-use serde_json::Value;
-use std::sync::Arc;
-use aws_sdk_dynamodb::config::retry::ShouldAttempt::No;
-use uuid::uuid;
 use crate::action::model::Action;
 use crate::action_execution::model::ActionExecution;
 use crate::assertion::model::Assertion;
 use crate::case::model::TestCase;
+use crate::har_resolver::{build_action_name_from_url, build_assertions, build_body_parameters_from_value, build_output_parameters_from_value, build_query_param, build_request_index_from_value, build_response_index_from_value};
+use crate::http::{ApiClient, HttpRequest, HttpResult};
 use crate::parameter::model::Parameter;
+use crate::persistence::repo::{current_timestamp, Repository};
 use crate::proxy::model::ProxyRecord;
 use crate::run::model::{Run, RunStatus};
+use axum::http;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 async fn handler(parts: http::request::Parts) {}
 
@@ -22,28 +20,26 @@ fn build_http_request(parts: http::request::Parts) -> HttpRequest {
 }
 
 async fn start_record(repository: Arc<Repository>, request: CreateProxyRecordRequest) -> ProxyRecord {
-    let test_case_id = uuid::Uuid::new_v4();
-    let test_case = TestCase {
-        customer_id: request.customer_id.clone(),
-        id: test_case_id.clone().to_string(),
-        name: request.name,
-        description: request.description,
-    };
+    let test_case = TestCase::builder()
+        .name(request.customer_id.clone())
+        .customer_id(request.customer_id.clone())
+        .description(request.description.clone())
+        .build();
+    let test_case_id = test_case.id.clone();
     let run_id = uuid::Uuid::new_v4();
-    let run = Run {
-        customer_id: test_case.customer_id.clone(),
-        test_case_id: test_case.id.clone(),
-        id: run_id.clone().to_string(),
-        status: RunStatus::InProgress,
-        started_at: "".to_string(),
-        finished_at: None,
-        assertion_results: None,
-    };
+    let run = Run::builder()
+        .id(run_id.to_string())
+        .customer_id(test_case.customer_id.clone())
+        .test_case_id(test_case.id.clone())
+        .status(RunStatus::InProgress)
+        .started_at(current_timestamp())
+        .build();
+
     let repo_clone = repository.clone();
     let repo_clone2 = repository.clone();
     tokio::task::spawn(async move {
         repo_clone.test_cases()
-            .create_test_case(test_case).await;
+            .create(test_case).await;
     });
 
     tokio::task::spawn(async move {
@@ -116,7 +112,7 @@ fn build_action_parameters(action: &Action, executions: Vec<ActionExecution>) ->
             parameters.extend(body_parameters);
             assertions.extend(build_assertions(&action, &indexes.0, &indexes.1));
         }
-        if let Some(res_value) = execution.response_body{
+        if let Some(res_value) = execution.response_body {
             let output_parameters = build_output_parameters_from_value(action, &res_value);
             parameters.extend(output_parameters);
         }
@@ -129,37 +125,32 @@ fn build_action_parameters(action: &Action, executions: Vec<ActionExecution>) ->
 
 fn build_action(test_case: &TestCase, http_req: &HttpRequest, order: usize) -> Action {
     let url = http_req.endpoint.to_url();
-    Action {
-        customer_id: test_case.customer_id.clone(),
-        test_case_id: test_case.id.clone(),
-        id: uuid::Uuid::new_v4().to_string(),
-        order,
-        url: url.clone(),
-        name: build_action_name_from_url(order, &url),
-        mime_type: Some(http_req.content_type.clone()),
-        method: http_req.endpoint.method.to_string(),
-    }
+    Action::builder()
+        .customer_id(test_case.customer_id.clone())
+        .test_case_id(test_case.id.clone())
+        .order(order)
+        .url(url.clone())
+        .name(build_action_name_from_url(order, &url))
+        .mime_type(http_req.content_type.clone())
+        .method(http_req.endpoint.method.to_string())
+        .build()
 }
 
 fn build_action_execution(run: &Run, action_id: &String, http_req: &HttpRequest, http_result: Option<HttpResult<Value>>) -> ActionExecution {
     let response_pair = http_result.map_or((0, None), |http_result: HttpResult<Value>|
         { (http_result.status_code, Some(http_result.res_body.value)) });
-    ActionExecution {
-        run_id: run.id.clone(),
-        customer_id: run.customer_id.clone(),
-        test_case_id: run.test_case_id.clone(),
-        action_id: action_id.clone(),
-        id: uuid::Uuid::new_v4().to_string(),
-        status_code: response_pair.0,
-        error: None,
-        response_body: response_pair.1,
-        request_body: http_req.get_body(),
-        query_params: http_req.endpoint.query_params.iter()
+    ActionExecution::builder()
+        .run_id(run.id.clone())
+        .customer_id(run.customer_id.clone())
+        .test_case_id(run.test_case_id.clone())
+        .action_id(action_id.clone())
+        .status_code(response_pair.0)
+        .maybe_response_body(response_pair.1)
+        .maybe_request_body(http_req.get_body())
+        .query_params(http_req.endpoint.query_params.iter()
             .map(|rp| { (rp.key.clone(), rp.value.clone()) })
-            .collect(),
-        started_at: "".to_string(),
-        finished_at: "".to_string(),
-    }
+            .collect())
+        .build()
 }
 
 fn update_execution(mut exec: ActionExecution, http_result: HttpResult<Value>) -> ActionExecution {
@@ -171,7 +162,7 @@ fn update_execution(mut exec: ActionExecution, http_result: HttpResult<Value>) -
 
 struct BuildActionParamResult {
     parameters: Vec<Parameter>,
-    assertions: Vec<Assertion>
+    assertions: Vec<Assertion>,
 }
 
 pub struct CreateProxyRecordRequest {

@@ -1,13 +1,14 @@
 use crate::api::AppError;
-use crate::persistence::repo::{build_composite_key, PageKey, QueryResult, Table};
+use crate::json_path::model::Expression;
+use crate::parameter::model::{Parameter, ParameterIn, ParameterLocation, ParameterType};
+use crate::persistence::model::{PageKey, QueryResult};
+use crate::persistence::repo::{build_composite_key, Table};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use serde_dynamo::to_attribute_value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
-use crate::json_path::model::Expression;
-use crate::parameter::model::{Parameter, ParameterIn, ParameterLocation, ParameterType};
 
 pub(crate) struct ParametersTable();
 

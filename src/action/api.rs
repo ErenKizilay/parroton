@@ -1,8 +1,9 @@
-use axum::extract::{Path, Query, State};
-use serde::Deserialize;
 use crate::action::model::Action;
 use crate::api::{ApiResponse, AppError};
-use crate::persistence::repo::{QueryResult, Repository};
+use crate::persistence::model::QueryResult;
+use crate::persistence::repo::Repository;
+use axum::extract::{Path, Query, State};
+use serde::Deserialize;
 
 pub async fn list_actions(
     Path(test_case_id): Path<String>,

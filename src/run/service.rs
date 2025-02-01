@@ -1,17 +1,15 @@
-use std::cmp::Ordering;
-use crate::persistence::repo::{build_composite_key, OnDeleteMessage, QueryResult, Table};
-use aws_sdk_dynamodb::primitives::{DateTime, DateTimeFormat};
-use aws_sdk_dynamodb::primitives::DateTimeFormat::DateTimeWithOffset;
+use crate::api::AppError;
+use crate::assertion::model::AssertionResult;
+use crate::persistence::model::QueryResult;
+use crate::persistence::repo::OnDeleteMessage::RunDeleted;
+use crate::persistence::repo::{build_composite_key, current_timestamp, OnDeleteMessage, Table};
+use crate::run::model::{Run, RunStatus};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
+use serde_dynamo::aws_sdk_dynamodb_1::to_attribute_value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
-use serde_dynamo::aws_sdk_dynamodb_1::to_attribute_value;
-use crate::api::{AppError};
-use crate::assertion::model::AssertionResult;
-use crate::persistence::repo::OnDeleteMessage::RunDeleted;
-use crate::run::model::{Run, RunStatus};
 
 pub struct RunOperations {
     pub(crate) client: Arc<Client>,
@@ -46,7 +44,7 @@ impl Table<Run> for RunTable {
     fn add_index_key_attributes(entity: &Run, item: &mut HashMap<String, AttributeValue>) {
         item.insert(
             "started_at".to_string(),
-            AttributeValue::S(entity.started_at.to_string()),
+            AttributeValue::N(entity.started_at.to_string()),
         );
     }
 
@@ -55,9 +53,7 @@ impl Table<Run> for RunTable {
     }
 
     fn ordering(e1: &Run, e2: &Run) -> Ordering {
-        let started_at1 = DateTime::from_str(e1.started_at.as_str(), DateTimeWithOffset).unwrap();
-        let started_at2 = DateTime::from_str(e2.started_at.as_str(), DateTimeWithOffset).unwrap();
-        started_at2.cmp(&started_at1)
+        e2.started_at.cmp(&e1.started_at)
     }
 }
 
@@ -96,31 +92,46 @@ impl RunOperations {
         status: &RunStatus,
         assertion_results: Vec<AssertionResult>,
     ) {
-        RunTable::update_builder(self.client.clone())
-            .set_key(Some(RunTable::unique_key(
-                build_composite_key(vec![customer_id.clone(), test_case_id.clone()]),
-                id.clone(),
-            )))
-            .expression_attribute_names("#fa", "finished_at")
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_names("#ar", "assertion_results")
-            .expression_attribute_values(
-                ":s",
-                AttributeValue::S(
-                    serde_json::to_string(status)
-                        .unwrap()
-                        .trim_matches('"')
-                        .to_string(),
-                ),
-            )
-            .expression_attribute_values(
-                ":fa",
-                AttributeValue::S(DateTime::from(SystemTime::now()).fmt(DateTimeWithOffset).unwrap()),
-            )
-            .expression_attribute_values(":ar", to_attribute_value(assertion_results).unwrap())
-            .update_expression("SET #fa = :fa, #s = :s, #ar = :ar")
-            .send()
+        RunTable::update_partial(build_composite_key(vec![customer_id.clone(), test_case_id.clone()]), id.clone(),
+                                 self.client.clone().update_item()
+                                     .expression_attribute_names("#fa", "finished_at")
+                                     .expression_attribute_names("#s", "status")
+                                     .expression_attribute_names("#ar", "assertion_results")
+                                     .expression_attribute_values(":s", to_attribute_value(status).unwrap())
+                                     .expression_attribute_values(":fa", AttributeValue::N(current_timestamp().to_string()))
+                                     .expression_attribute_values(":ar", to_attribute_value(assertion_results).unwrap())
+                                     .update_expression("SET #fa = :fa, #s = :s, #ar = :ar"))
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::repo::{init_logger, Repository};
+
+
+    #[tokio::test]
+    async fn crud() {
+        init_logger();
+        let repository = Repository::new().await;
+        let run = Run::builder()
+            .customer_id("cust1".to_string())
+            .test_case_id("tc1".to_string())
+            .id("r1".to_string())
+            .status(RunStatus::InProgress)
+            .started_at(current_timestamp())
+            .build();
+        repository.runs()
+            .create(run).await;
+        let update_result = repository.runs()
+            .update(&"cust1".to_string(), &"tc1".to_string(), &"r1".to_string(), &RunStatus::Finished, vec![])
+            .await;
+        let get_result = repository.runs()
+            .get(&"cust1".to_string(), &"tc1".to_string(), &"r1".to_string())
+            .await;
+        assert_eq!(get_result.is_ok(), true);
+        assert_eq!(get_result.unwrap().unwrap().status, RunStatus::Finished);
     }
 }

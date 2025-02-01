@@ -1,8 +1,8 @@
-use axum::extract::{Path, State};
 use crate::api::{ApiResponse, AppError, AppState};
-use crate::persistence::repo::QueryResult;
+use crate::persistence::model::QueryResult;
 use crate::run::execution::{run_test, RunTestCaseCommand};
 use crate::run::model::Run;
+use axum::extract::{Path, State};
 
 pub async fn run_test_case(
     Path(id): Path<String>,

@@ -1,12 +1,15 @@
-use std::io::{Cursor, ErrorKind};
-use axum::extract::{Multipart, Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use har::{Error, Har};
 use crate::api::{ApiResponse, AppError};
 use crate::case::model::TestCase;
 use crate::har_resolver::{build_test_case, filter_entries};
-use crate::persistence::repo::{QueryResult, Repository};
+use crate::persistence::model::QueryResult;
+use crate::persistence::repo::Repository;
+use axum::extract::{Multipart, Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use har::{Error, Har};
+use serde::Deserialize;
+use std::io::{Cursor, ErrorKind};
 
 pub async fn get_test_case(
     Path(id): Path<String>,
@@ -18,8 +21,9 @@ pub async fn get_test_case(
 
 pub async fn list_test_cases(
     State(repository): State<Repository>,
+    Query(params): Query<ListTestCaseParams>,
 ) -> Result<ApiResponse<QueryResult<TestCase>>, AppError> {
-    let result = repository.test_cases().list("eren".to_string(), None).await;
+    let result = repository.test_cases().list("eren".to_string(), params.next_page_key, params.keyword).await;
     ApiResponse::from(result)
 }
 
@@ -42,7 +46,10 @@ pub async fn upload_test_case(
                 provided_description = field.text().await.unwrap();
             }
             "auth_providers" => {
-                provided_auth_providers = serde_json::from_str(field.text().await.unwrap().as_str()).unwrap();
+                provided_auth_providers = field.text().await.unwrap()
+                    .split(",")
+                    .map(|s| s.to_string().trim().to_string())
+                    .collect();
             }
             "excluded_paths" => {
                 provided_excluded_path_parts = field
@@ -93,7 +100,7 @@ pub async fn filter_paths(mut multipart: Multipart) -> Result<ApiResponse<Vec<St
                     .await
                     .unwrap()
                     .split(",")
-                    .map(|s| s.to_string())
+                    .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
             }
@@ -127,4 +134,49 @@ pub async fn delete_test_case(
         .delete(&"eren".to_string(), &id)
         .await;
     StatusCode::NO_CONTENT
+}
+
+pub async fn update_test_case(
+    Path(id): Path<String>,
+    State(repository): State<Repository>,
+    Json(payload): Json<UpdateTestCasePayload>,
+) -> Result<ApiResponse<TestCase>, AppError> {
+    let result = repository.test_cases()
+        .update("eren".to_string(), id, payload.name, payload.description).await;
+    ApiResponse::from(result)
+}
+
+pub async fn update_test_case_name(
+    Path(id): Path<String>,
+    State(repository): State<Repository>,
+    Json(payload): Json<UpdateNamePayload>,
+) -> Result<ApiResponse<TestCase>, AppError> {
+    let result = repository.test_cases().update_name("eren".to_string(), id, payload.value).await;
+    ApiResponse::from(result)
+}
+
+pub async fn update_test_case_description(
+    Path(id): Path<String>,
+    State(repository): State<Repository>,
+    Json(payload): Json<UpdateNamePayload>,
+) -> Result<ApiResponse<TestCase>, AppError> {
+    let result = repository.test_cases().update_description("eren".to_string(), id, payload.value).await;
+    ApiResponse::from(result)
+}
+
+#[derive(Deserialize, Clone)]
+pub struct  UpdateNamePayload {
+    pub value: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct  UpdateTestCasePayload {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct  ListTestCaseParams {
+    pub next_page_key: Option<String>,
+    pub keyword: Option<String>
 }

@@ -1,6 +1,7 @@
+use crate::json_path::model::Expression;
+use bon::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::json_path::model::Expression;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ParameterType {
@@ -24,16 +25,19 @@ pub enum ParameterLocation {
     Body(String),
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Builder)]
 pub struct Parameter {
     pub customer_id: String,
     pub test_case_id: String,
     pub action_id: String,
+    #[builder(default = uuid::Uuid::new_v4().to_string())]
     pub id: String,
     pub parameter_type: ParameterType,
     pub location: ParameterLocation,
     pub value: Value,
     pub value_expression: Option<Expression>,
+    pub created_at: Option<u64>,
+    pub updated_at: Option<u64>,
 
 }
 
