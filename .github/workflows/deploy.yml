@@ -4,22 +4,20 @@ on:
   workflow_dispatch:
 
 jobs:
+
   deploy:
     runs-on: ubuntu-latest
+    container: ghcr.io/railwayapp/cli:latest
+    env:
+      SVC_ID: d590b651-ba6a-49cc-b011-2055c071202e
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Railway CLI
-        run: npm install -g @railway/cli
-      - name: Set AWS credentials
-        run:
+      - uses: actions/checkout@v3
+      - run:
           |
-          railway variables set AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-          railway variables set AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          railway variables set AWS_DEFAULT_REGION=eu-central-1
-
-      - name: Deploy to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up
+          railway link --service ${{ env.SVC_ID }} --project dae527fd-29d2-43a3-9bfb-618ff6da311b
+          railway service ${{ env.SVC_ID }}
+          railway variables --set "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}"
+          railway variables --set "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          railway variables --set "AWS_DEFAULT_REGION=eu-central-1"
+          railway up --service=${{ env.SVC_ID }}
