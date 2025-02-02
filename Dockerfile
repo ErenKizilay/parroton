@@ -1,22 +1,19 @@
-# ---- Build Stage ----
-FROM rust:1.70-bullseye as builder
+FROM rust:slim as builder
+WORKDIR /usr/src/myapp
 
-WORKDIR /app
+# Install dependencies required for OpenSSL
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
+RUN cargo install --path .
 
-# Ensure dependencies are installed
-RUN apt-get update && apt-get install -y pkg-config libssl-dev
+FROM debian:bookworm-slim
 
-# Build the Rust project
-RUN cargo build --release
+RUN apt-get update && apt-get install -y \
+    libssl3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# ---- Runtime Stage ----
-FROM debian:bullseye-slim
-
-# Install only necessary runtime dependencies
-RUN apt-get update && apt-get install -y libssl1.1 ca-certificates
-
-WORKDIR /app
-COPY --from=builder /app/target/release/my-rust-app .
-
-CMD ["./my-rust-app"]
+COPY --from=builder /usr/local/cargo/bin/parroton /usr/local/bin/parroton
+CMD ["parroton"]
